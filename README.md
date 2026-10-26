@@ -6,8 +6,15 @@
 
 ## 当前状态
 
-v1.4 设计已完整落地为 Python 包（解析器 / 存储 / 遗忘强化 / 检索 / 每轮流程 / HTTP 适配层 / CLI），
-测试覆盖设计文档 §10 的解析与公式用例。生产接入见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+**v1.4 实现完成、可接入现网**（2026-10-26）：
+
+- 设计文档 v1.4 的全部机制已落地为 Python 包：哨兵解析 / JSONL 存储 / 遗忘强化 / 检索 / 每轮流程 /
+  HTTP 适配层 / CLI；Obsidian 严格只读。
+- `python -m pytest -q` → **257 passed**，覆盖 §10.2 解析异常、§10.3 公式自检、§10.1 行为用例与端到端。
+- 已过一轮独立代码审查，修复了失败隔离、闸门强制、坏数据容错、压抑持久化、向量维度等 P0/P1 问题。
+- 当前阶段：**库就绪，待接入现网 qq-bridge**（HTTP 两阶段接口与 Node 示例已就绪，
+  见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)）。
+- 源码与提交记录：<https://github.com/ang516/qihun-mem>
 
 ## 核心特性
 
