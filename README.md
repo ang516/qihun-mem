@@ -35,23 +35,9 @@ qihun-mem/
 ```
 ## 快速开始
 
-实现中，以下为规划命令。
-
-bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-
 ## 复制示例配置：
 
-bash
-cp examples/state.example.json state.json
-cp examples/users.example.json users.json
-
 ## 运行测试：
-
-bash
-pytest
 
 ## 文档
 **QiHun-Memory-System v1.4.md
@@ -59,16 +45,25 @@ pytest
 ## 硬规则摘要
 
 每条记忆必须有 user_id 和 scope
+
 检索必须先过滤 scope，再打分
+
 注入 prompt 的记忆必须标注说话人
+
 每轮最多一次 LLM 调用
+
 写入必须过闸门
+
 valence 永不单独驱动行为
+
 S 永不超过 90 天
+
 压抑只调制 S_eff，永不改写 S
+
 记忆系统禁止回写 state.json
+
 LLM 提取失败不得影响回答生成
 
 ## License
 
-待定。
+待定
