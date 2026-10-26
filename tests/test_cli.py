@@ -19,7 +19,8 @@ def test_init_and_status(tmp_path, capsys) -> None:
     assert code == 0
     assert (data_dir / "memory.jsonl").is_file()
     assert (data_dir / "persona.md").is_file()
-    assert (data_dir / "state.json").is_file()
+    # §11 规则 9：init 不代写 state.json（由情感系统写入）
+    assert not (data_dir / "state.json").exists()
     assert (data_dir / "users.json").is_file()
 
     code, out = run_cli(["status", "--data-dir", str(data_dir)], capsys)

@@ -13,7 +13,6 @@ from pathlib import Path
 
 from .config import Config, load_config
 from .memory import MemorySystem
-from .models import utc_now
 from .obsidian import ReadOnlyObsidianVault, VaultError
 from .pipeline import TurnEvent, TurnPipeline, retrieval_summary
 from .prompt import render_memory_block
@@ -116,12 +115,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     cfg = _load(args)
     cfg.ensure_dirs()
     created: list[str] = []
-    if not cfg.bot_state_file.exists():
-        cfg.bot_state_file.write_text(
-            json.dumps({"valence": 0.0, "avoidance": 0.0, "updated_at": utc_now().isoformat(timespec="seconds")}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        created.append(str(cfg.bot_state_file))
+    # 注意：不创建 state.json —— 它由情感系统写入，记忆系统只读（§11 规则 9）
     if not cfg.users_file.exists():
         cfg.users_file.write_text("{}\n", encoding="utf-8")
         created.append(str(cfg.users_file))
@@ -139,6 +133,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"  - {path}")
     else:
         print("数据文件已存在，未修改。")
+    print("提示：state.json 由情感系统写入（记忆系统只读，不会代写，见 §11 规则 9）")
     print("下一步：qihun-memory status   # 查看状态")
     return 0
 
