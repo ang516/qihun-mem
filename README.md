@@ -10,10 +10,13 @@
 
 - 设计文档 v1.4 的全部机制已落地为 Python 包：哨兵解析 / JSONL 存储 / 遗忘强化 / 检索 / 每轮流程 /
   HTTP 适配层 / CLI；Obsidian 严格只读。
-- `python -m pytest -q` → **291 passed**，覆盖 §10.2 解析异常、§10.3 公式自检、§10.1 行为用例与端到端，
-  以及旧库导入的映射 / 幂等 / 干跑 / 坏数据 / 只读零落盘、Obsidian 只读视图导出用例。
+- `python -m pytest -q` → **292 passed**（Python 3.11 上 291 passed + 1 skipped 兼容守卫用例），
+  覆盖 §10.2 解析异常、§10.3 公式自检、§10.1 行为用例与端到端，以及旧库导入的映射 / 幂等 /
+  干跑 / 坏数据 / 只读零落盘、Obsidian 只读视图导出用例与 Python 3.11 语法兼容守卫。
 - qq-bridge 侧新增 `qihun-memory.mjs` 适配器与一键接入脚本，自带 **66 个 node:test 用例**；
   `npm run test:vault` 10 passed、桥接 audit 41/46（其余 5 个为本机既有环境问题，与本项目无关）。
+- CI：[.github/workflows/ci.yml](.github/workflows/ci.yml) 在 GitHub Actions 上跑 Python
+  3.11 / 3.12 / 3.13 / 3.14 四版本矩阵，收集/导入阶段即校验 3.11 兼容性。
 - 已过两轮独立代码审查（第二轮在现网跑起来后）：修复同会话 turn 映射、一键接入对运行中服务的并发写、
   finish 时状态切换的哨兵外泄、dry-run 落盘、归档后重导、at_bot 透传、服务崩溃恢复与每日维护等 P0/P1。
 - **旧 Obsidian 记忆库已一次性导入**（12 篇 episodes + clues + 滚动摘要 + persona 状态 + 人设，

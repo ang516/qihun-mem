@@ -220,7 +220,7 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
   `persona_path=data/persona.md`（vault 不再是运行依赖）；`summary_tokens=500`（现网偏差）；
   `baseUrl` 留空时按 qihun host/port 推导；setup 先备份 qihun 配置、importer 180s 超时；私聊昵称不再污染
   `users.json`；注入顺序统一；日志打印原始 prompt。
-- 修复后验收：Python **291 passed**；桥接 `npm run test:qihun` **66 pass**、`test:vault` 10 pass、
+- 修复后验收：Python **292 passed**（3.11 上 291 passed + 1 skipped）；桥接 `npm run test:qihun` **66 pass**、`test:vault` 10 pass、
   audit 41/46（5 个为本机既有环境问题）；真实环境已重部署（新桥接进程 + 新服务进程，`/health`
   `total=15`，`users.json` 含「群记忆 / 管理员」，persona 从 `data/persona.md` 读取）。
 ### 10.2 Obsidian 只读视图（2026-10-26 追加）
@@ -233,6 +233,10 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
 - 现网验证：`D:/AI-Agent-Vault/器魂记忆/` 已生成 6 个文件（15 条记忆），Obsidian REST API 搜索
   「大白饭」能命中 `器魂记忆/10_群聊记忆.md`；启动导出日志 `未变 6`（幂等）。旧库根目录新增
   `器魂记忆入口.md` 指路（旧 persona/memory/clues 保留为归档）。
+- 修复 CI（3.11 矩阵）收集失败：`_render_users_state` 在 f-string 表达式里复用了同种双引号，
+  属于 PEP 701 写法（仅 Python 3.12+ 支持），3.11 直接 SyntaxError；改为先算 `embed_status` 再插值。
+  新增 `tests/test_syntax_compat.py` 在 3.12+ 用新版分词器扫描 src/tests，禁止 3.11 不兼容的
+  f-string 写法（同引号复用、表达式内反斜杠/注释）。
 
 - 已知限制：`vaultMemory` 与 `qihunMemory` 同时开启时，pumpMux 先执行旧 vault 的 `consumeTurn`
   （会先剥掉隐藏块），导致新版 finish 拿不到哨兵、从而不写记忆。setup 默认已关闭旧 vault；

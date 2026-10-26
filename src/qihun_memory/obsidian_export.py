@@ -201,12 +201,17 @@ def _render_users_state(system: MemorySystem, report: ExportReport) -> str:
     counts = system.store.counts()
     users = system.users.snapshot()
     snapshot = state.updated_at or _snapshot_text(system.all_items(), "")
+    embed_status = (
+        "可用"
+        if getattr(system.embedder, "available", False)
+        else "不可用（纯 BM25 降级）"
+    )
     body = [_header("qihun-memory-state", snapshot), "# 用户与状态", ""]
     body += ["## 统计", ""]
     body += [
         f"- 记忆总数：{counts.get('total', 0)}（active {counts.get('active', 0)} / dormant {counts.get('dormant', 0)}）",
         f"- 归档：{report.archived} 条（见 [[40_已归档记忆]]）",
-        f"- embedding：{"可用" if getattr(system.embedder, 'available', False) else "不可用（纯 BM25 降级）"}",
+        f"- embedding：{embed_status}",
         "",
         "## 昵称快照（users.json）",
         "",
