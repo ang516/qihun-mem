@@ -245,7 +245,8 @@ def test_bm25_raw_matches_hand_computed_formula():
 
 def test_minmax_normalization_boundaries():
     assert _minmax([]) == []
-    assert _minmax([2.0, 2.0]) == [0.0, 0.0]  # max == min
+    assert _minmax([0.0, 0.0]) == [0.0, 0.0]  # max == min == 0
+    assert _minmax([2.0, 2.0]) == [1.0, 1.0]  # 同为正分（含单候选）→ 1.0
     normalized = _minmax([1.0, 2.0, 3.0])
     assert normalized == pytest.approx([0.0, 0.5, 1.0])
     assert all(0.0 <= value <= 1.0 for value in normalized)
@@ -260,12 +261,14 @@ def test_bm25_batch_normalization_in_search():
     assert by_id["other"].bm25 == pytest.approx(0.0)
 
 
-def test_bm25_single_candidate_max_equals_min_is_zero():
+def test_bm25_single_candidate_max_equals_min_is_one():
     retriever, _ = make_retriever()
     result = search(retriever, [make_item("only", "上海出差")], "上海")
     assert len(result.selected) == 1
-    assert result.selected[0].bm25 == 0.0
-    assert result.selected[0].score == 0.0
+    # 单候选同为正分 → 归一化 1.0，避免降级模式永不强化/复活（B5）
+    assert result.selected[0].bm25 == 1.0
+    assert result.selected[0].score > 0.0
+    assert result.selected[0].sim == 1.0
 
 
 def test_latin_query_is_case_insensitive():
