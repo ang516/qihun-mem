@@ -1,0 +1,73 @@
+{
+  "data_dir": "./data",
+  "vault_dir": "",
+  "persona_path": "",
+  "embedding": {
+    "enabled": true,
+    "backend": "sentence-transformers",
+    "model": "BAAI/bge-small-zh-v1.5",
+    "model_path": "",
+    "dim": 512,
+    "device": "cpu"
+  },
+  "decay": {
+    "s0_episode": 7.0,
+    "s0_fact": 30.0,
+    "s_max": 90.0,
+    "dormant_r": 0.1,
+    "archive_r": 0.02,
+    "revive_sim": 0.7,
+    "reinforce_sim": 0.5,
+    "dedupe_sim": 0.9,
+    "kv": 0.5,
+    "lam": 0.2,
+    "suppression_valence": -0.3,
+    "suppression_avoidance": 0.5,
+    "min_effective_ratio": 0.8
+  },
+  "retrieval": {
+    "budget_tokens": 1200,
+    "header_tokens": 20,
+    "w_vector": 0.6,
+    "w_bm25": 0.4,
+    "type_bonus": {
+      "preference": 1.1,
+      "fact": 1.0,
+      "episode": 0.9
+    },
+    "dormant_factor": 0.3,
+    "mood_bias_enabled": true,
+    "mood_bias_beta": 0.2,
+    "bm25_k1": 1.5,
+    "bm25_b": 0.75,
+    "light_path_enabled": true
+  },
+  "extraction": {
+    "max_items": 5,
+    "max_content": 500,
+    "max_tags": 8,
+    "max_tag_len": 16
+  },
+  "prompt": {
+    "summary_tokens": 200,
+    "recent_turns": 5
+  },
+  "gate": {
+    "enabled": true,
+    "extra_patterns": []
+  },
+  "state": {
+    "stale_hours": 6
+  },
+  "metrics": {
+    "enabled": true,
+    "log_path": "logs/metrics.jsonl",
+    "debug_raw": false,
+    "debug_raw_retention_days": 7
+  },
+  "service": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "token": ""
+  }
+}

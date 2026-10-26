@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime data (created by `qihun-memory init`, never committed)
+data/
+logs/
+*.tmp
+*.log
+
+# Local / machine-specific
+config.local.json
+.DS_Store
+Thumbs.db
