@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,8 @@ def _sanitize(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
+        # 代理字符会让 json 写出 / utf-8 写盘抛 UnicodeEncodeError，日志绝不能影响主流程
+        value = value.encode("utf-8", "replace").decode("utf-8")
         return value if len(value) <= 300 else value[:300] + "…"
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in list(value)[:10]]
@@ -40,7 +42,7 @@ class Metrics:
         if not self.enabled:
             return
         record: dict[str, Any] = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "event": name,
         }
         for key, value in fields.items():

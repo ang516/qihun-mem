@@ -52,7 +52,13 @@ def _unpack_vector(payload: str, dim: int) -> list[float]:
 class MemoryStore:
     """单实例、单写者的 jsonl 存储。"""
 
-    def __init__(self, cfg: Config, metrics: Metrics | None = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        metrics: Metrics | None = None,
+        *,
+        vector_dim: int | None = None,
+    ) -> None:
         self.cfg = cfg
         self.metrics = metrics
         self.items: dict[str, MemoryItem] = {}
@@ -60,6 +66,8 @@ class MemoryStore:
         self._turn_keys: dict[str, str] = {}
         self.loaded = False
         self.load_report = LoadReport()
+        # 优先用 embedder 的实际维度（配置 dim 可能与真实模型不一致，见 B6）
+        self.vector_dim = int(vector_dim) if vector_dim and vector_dim > 0 else max(1, int(cfg.embedding.dim))
 
     # ------------------------------------------------------------------
     # 路径
@@ -109,7 +117,12 @@ class MemoryStore:
                 self._turn_keys[item.turn_key] = item.id
         if bad_lines:
             report.new_bad = self._append_bad_lines(bad_lines)
-        self._seq = max((self._seq_of(item_id) for item_id in self.items), default=0)
+        # id 自增还要考虑已归档条目，否则归档最大 id 后重启会重用 id（B14）
+        archived_seq = max((self._seq_of(item_id) for item_id in self._archived_ids()), default=0)
+        self._seq = max(
+            max((self._seq_of(item_id) for item_id in self.items), default=0),
+            archived_seq,
+        )
         report.vector_loaded, report.vector_errors = self.load_vectors()
         self.loaded = True
         self.load_report = report
@@ -167,6 +180,17 @@ class MemoryStore:
         except (ValueError, IndexError):
             return 0
 
+    def _archived_ids(self) -> list[str]:
+        ids: list[str] = []
+        for line in self._read_lines(self.archive_path):
+            if not line.strip():
+                continue
+            try:
+                ids.append(str(json.loads(line)["id"]))
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                continue
+        return ids
+
     def next_id(self) -> str:
         self._seq += 1
         return f"m_{self._seq:04d}"
@@ -206,22 +230,27 @@ class MemoryStore:
         self._turn_keys = {item.turn_key: item.id for item in item_list if item.turn_key}
 
     def archive(self, item_ids: Iterable[str]) -> int:
-        """把死记忆移入 memory.archive.jsonl（不物理删除，§8 / 原则 4）。"""
+        """把死记忆移入 memory.archive.jsonl（不物理删除，§8 / 原则 4）。
+
+        幂等：已在 archive 里的 id 不会重复追加（archive 成功但 rewrite 失败的重试场景）。
+        """
         ids = [item_id for item_id in item_ids if item_id in self.items]
         if not ids:
             return 0
-        archived = [self.items[item_id] for item_id in ids]
+        already = set(self._archived_ids())
+        to_append = [self.items[item_id] for item_id in ids if item_id not in already]
         try:
             self.archive_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.archive_path, "a", encoding="utf-8", newline="\n") as handle:
-                for item in archived:
-                    handle.write(json.dumps(item.to_dict(), ensure_ascii=False, separators=(",", ":")) + "\n")
+            if to_append:
+                with open(self.archive_path, "a", encoding="utf-8", newline="\n") as handle:
+                    for item in to_append:
+                        handle.write(json.dumps(item.to_dict(), ensure_ascii=False, separators=(",", ":")) + "\n")
         except OSError as exc:
             log.warning("archive append failed, keep items in memory: %r", exc)
             return 0
         remaining = [item for item_id, item in self.items.items() if item_id not in set(ids)]
         self.rewrite(remaining)
-        return len(archived)
+        return len(ids)
 
     # ------------------------------------------------------------------
     # 向量 sidecar（§2 / §6.5）
@@ -230,7 +259,7 @@ class MemoryStore:
     def load_vectors(self) -> tuple[int, int]:
         loaded = 0
         errors = 0
-        dim = max(1, int(self.cfg.embedding.dim))
+        dim = self.vector_dim
         for line in self._read_lines(self.vector_path):
             if not line.strip():
                 continue

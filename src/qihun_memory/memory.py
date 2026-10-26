@@ -91,7 +91,11 @@ class MemorySystem:
             enabled=cfg.metrics.enabled,
         )
         self.embedder: Embedder = embedder if embedder is not None else get_embedder(cfg.embedding)
-        self.store = MemoryStore(cfg, self.metrics)
+        self.store = MemoryStore(
+            cfg,
+            self.metrics,
+            vector_dim=getattr(self.embedder, "dim", 0) or None,
+        )
         self.store.load()
         self.users = UserDirectory(cfg.users_file)
         self.retriever = Retriever(self.embedder, cfg, self.metrics)
@@ -219,12 +223,16 @@ class MemorySystem:
         bot_state: BotState,
         now: datetime,
     ) -> int:
-        """惰性归档：R < 0.1 → dormant（只翻内存状态，文件不动）。"""
+        """惰性归档：R < 0.1 → dormant（只翻内存状态，文件不动）。
+
+        判定使用**未压抑**的 R：dormant 是持久状态，压抑只允许临时影响可提取性
+        （§5.2「不是忘掉，是不易想起」）；否则几轮回避就会把记忆永久降级（A4）。
+        """
         changed = 0
         for item in self._scope_items(scope, user_id):
             if item.status != "active":
                 continue
-            r = retention_now(item, now=now, avoidance_now=bot_state.avoidance, cfg=self.cfg.decay)
+            r = retention_now(item, now=now, avoidance_now=0.0, cfg=self.cfg.decay)
             if r < self.cfg.decay.dormant_r:
                 item.status = "dormant"
                 changed += 1
@@ -243,7 +251,7 @@ class MemorySystem:
         """纯检索：不强化（强化只在「被选中并注入」之后由 reinforce 执行）。"""
         current = now or utc_now()
         bot_state = self.state(current)
-        self.ensure_vectors()
+        # 不在检索路径里补算向量：embedding 属于写入/后台补算（§6.5），不能阻塞宿主取 prompt
         self._refresh_statuses(scope, user_id, bot_state, current)
         return self.retriever.search(
             self.store.items.values(),
@@ -261,13 +269,16 @@ class MemorySystem:
         changed = 0
         for entry in result.selected:
             item = entry.item
-            if item.status == "dormant" and entry.sim > self.cfg.decay.revive_sim:
-                item.S = revive_stability(item.type, self.cfg.decay)
-                item.status = "active"
-                item.last_access = now_iso
-                item.access_count += 1
-                self.metrics.event("memory.revived", reason="strong_match", item_id=item.id)
-                changed += 1
+            if item.status == "dormant":
+                # 只有强匹配才复活；0.5~0.7 区间不强化、不刷新 last_access，
+                # 避免出现「永远 dormant 但一直在注入」的僵尸状态（B4）
+                if entry.sim > self.cfg.decay.revive_sim:
+                    item.S = revive_stability(item.type, self.cfg.decay)
+                    item.status = "active"
+                    item.last_access = now_iso
+                    item.access_count += 1
+                    self.metrics.event("memory.revived", reason="strong_match", item_id=item.id)
+                    changed += 1
                 continue
             if entry.sim > self.cfg.decay.reinforce_sim:
                 item.S = reinforce_stability(item.S, entry.r, self.cfg.decay)
@@ -288,9 +299,18 @@ class MemorySystem:
         content = raw.get("content")
         if item_type not in ALLOWED_TYPES or not isinstance(content, str):
             return None
-        cleaned = "".join(ch for ch in content if ch >= " " and ch != chr(127)).strip()
+        cleaned_chars: list[str] = []
+        for ch in content:
+            code = ord(ch)
+            if code < 32 or code == 127 or 0x80 <= code <= 0x9F or 0xD800 <= code <= 0xDFFF:
+                continue
+            cleaned_chars.append(ch)
+        cleaned = "".join(cleaned_chars).strip()
         cleaned = cleaned[: self.cfg.extraction.max_content]
         if not cleaned:
+            return None
+        # 纵深防御：解析器已拒绝，直接 API 调用也不能把哨兵/围栏写进记忆
+        if "<MEMORY_JSON>" in cleaned or "</MEMORY_JSON>" in cleaned or chr(96) * 3 in cleaned:
             return None
         tags_raw = raw.get("tags")
         tags: list[str] = []
@@ -359,7 +379,10 @@ class MemorySystem:
         if turn_key and self.store.has_turn_key(turn_key):
             report.turn_duplicate = True
             report.skipped = len(items_in)
-            self.metrics.event("mem_write.turn_dup", turn_key=turn_key)
+            self.metrics.event(
+                "mem_write.turn_dup",
+                turn_key_hash=hashlib.sha256(turn_key.encode("utf-8", "replace")).hexdigest()[:16],
+            )
             return report
 
         self.retry_pending(now=current)
@@ -404,7 +427,7 @@ class MemorySystem:
             )
             try:
                 self.store.append(item)
-            except OSError as exc:
+            except Exception as exc:  # 含 UnicodeEncodeError 等：落盘失败绝不能影响回答（§11 规则 13）
                 report.failed += 1
                 self.metrics.event("mem_write.fail", exc_type=type(exc).__name__)
                 self._pending.append(_PendingWrite(item=item))
@@ -420,6 +443,9 @@ class MemorySystem:
                 S=round(item.S, 3),
             )
 
+        # turn_key 在「整轮全部命中合并」时也要登记，否则重放会重复累加 mention_count（B3）
+        if turn_key and (report.created or report.merged):
+            self.store.register_turn_key(turn_key, (report.created or report.merged)[0].id)
         report.pending = len(self._pending)
         return report
 
@@ -434,7 +460,7 @@ class MemorySystem:
         for entry in pending:
             try:
                 self.store.append(entry.item)
-            except OSError as exc:
+            except Exception as exc:
                 dropped += 1
                 self.metrics.event("mem_write.fail", exc_type=type(exc).__name__, reason="retry_dropped")
                 continue
@@ -454,7 +480,8 @@ class MemorySystem:
         report = MaintenanceReport()
         dead_ids: list[str] = []
         for item in list(self.store.items.values()):
-            r = retention_now(item, now=current, avoidance_now=bot_state.avoidance, cfg=self.cfg.decay)
+            # 归档/降级判定同样用未压抑 R：临时回避不能让记忆被永久移档（A4）
+            r = retention_now(item, now=current, avoidance_now=0.0, cfg=self.cfg.decay)
             if r < self.cfg.decay.archive_r:
                 dead_ids.append(item.id)
             elif r < self.cfg.decay.dormant_r and item.status == "active":
@@ -471,6 +498,10 @@ class MemorySystem:
         report.pending_retried = retry["written"]
         report.pending_dropped = retry["dropped"]
         report.debug_raw_cleaned = self.clean_debug_logs(current)
+        try:
+            self.ensure_vectors()  # 维护时补算缺失向量（不阻塞聊天，§6.5）
+        except Exception:
+            pass
         if report.archived:
             self.metrics.event("memory.archived", count=report.archived)
         self.metrics.event(
@@ -493,6 +524,10 @@ class MemorySystem:
         if not self.cfg.metrics.debug_raw:
             return
         text = raw or ""
+        try:
+            text = text.encode("utf-8", "replace").decode("utf-8")
+        except Exception:
+            return
         record = {
             "ts": utc_now_iso(),
             "turn_id": turn_id,
@@ -503,11 +538,12 @@ class MemorySystem:
             self.debug_raw_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.debug_raw_path, "a", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError:
+        except Exception:
             pass
 
     def clean_debug_logs(self, now: datetime | None = None) -> int:
-        if not self.cfg.metrics.debug_raw or not self.debug_raw_path.is_file():
+        # 即使 debug_raw 已关闭，也要清理历史残留的原文日志（隐私最小化）
+        if not self.debug_raw_path.is_file():
             return 0
         current = now or utc_now()
         cutoff = current - timedelta(days=self.cfg.metrics.debug_raw_retention_days)
@@ -543,8 +579,12 @@ class MemorySystem:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """进程退出时全量重写一次（§2：全量重写只在退出或每日一次）。"""
+        """进程退出时重试 pending + 全量重写一次（§2：全量重写只在退出或每日一次）。"""
+        try:
+            self.retry_pending()
+        except Exception:
+            pass
         try:
             self.store.rewrite()
-        except OSError as exc:
+        except Exception as exc:
             log.warning("final rewrite failed: %r", exc)

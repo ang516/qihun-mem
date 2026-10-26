@@ -140,71 +140,62 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     system = MemorySystem(_load(args))
-    try:
-        _dump(system.stats())
-        state_path = system.cfg.bot_state_file
-        if not state_path.exists():
-            print(f"提示：{state_path} 不存在（情感系统尚未写入，当前按中性处理）", file=sys.stderr)
-    finally:
-        system.close()
+    _dump(system.stats())
+    state_path = system.cfg.bot_state_file
+    if not state_path.exists():
+        print(f"提示：{state_path} 不存在（情感系统尚未写入，当前按中性处理）", file=sys.stderr)
     return 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:
     system = MemorySystem(_load(args))
-    try:
-        result = system.search(args.query, args.scope, args.user)
-        if args.json:
-            _dump(
-                {
-                    "retrieval": retrieval_summary(result),
-                    "selected": [
-                        {
-                            "id": entry.item.id,
-                            "type": entry.item.type,
-                            "status": entry.item.status,
-                            "score": round(entry.score, 6),
-                            "r": round(entry.r, 6),
-                            "sim": round(entry.sim, 6),
-                            "content": entry.item.content,
-                        }
-                        for entry in result.selected
-                    ],
-                }
-            )
-        else:
-            block = render_memory_block(result.selected, system.users)
-            print(block if block else "（无命中）")
-            print(f"\n候选 {result.candidates} 条，注入 {len(result.selected)} 条，{result.tokens}/{result.budget} tokens，degraded={result.degraded}")
-    finally:
-        system.close()
+    result = system.search(args.query, args.scope, args.user)
+    if args.json:
+        _dump(
+            {
+                "retrieval": retrieval_summary(result),
+                "selected": [
+                    {
+                        "id": entry.item.id,
+                        "type": entry.item.type,
+                        "status": entry.item.status,
+                        "score": round(entry.score, 6),
+                        "r": round(entry.r, 6),
+                        "sim": round(entry.sim, 6),
+                        "content": entry.item.content,
+                    }
+                    for entry in result.selected
+                ],
+            }
+        )
+    else:
+        block = render_memory_block(result.selected, system.users)
+        print(block if block else "（无命中）")
+        print(f"\n候选 {result.candidates} 条，注入 {len(result.selected)} 条，{result.tokens}/{result.budget} tokens，degraded={result.degraded}")
     return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
     system = MemorySystem(_load(args))
-    try:
-        items = system.all_items()
-        if args.scope:
-            items = [item for item in items if item.scope == args.scope]
-        if args.user:
-            items = [item for item in items if item.user_id == args.user]
-        if args.status != "all":
-            items = [item for item in items if item.status == args.status]
-        items.sort(key=lambda item: item.id)
-        items = items[: max(1, args.limit)]
-        if args.json:
-            _dump([item.to_dict() for item in items])
-        else:
-            for item in items:
-                print(
-                    f"{item.id}  {item.type:<10} {item.status:<8} S={item.S:6.2f}  "
-                    f"{item.user_id}  {item.content}"
-                )
-            if not items:
-                print("（空）")
-    finally:
-        system.close()
+    items = system.all_items()
+    if args.scope:
+        items = [item for item in items if item.scope == args.scope]
+    if args.user:
+        items = [item for item in items if item.user_id == args.user]
+    if args.status != "all":
+        items = [item for item in items if item.status == args.status]
+    items.sort(key=lambda item: item.id)
+    items = items[: max(1, args.limit)]
+    if args.json:
+        _dump([item.to_dict() for item in items])
+    else:
+        for item in items:
+            print(
+                f"{item.id}  {item.type:<10} {item.status:<8} S={item.S:6.2f}  "
+                f"{item.user_id}  {item.content}"
+            )
+        if not items:
+            print("（空）")
     return 0
 
 
@@ -261,15 +252,12 @@ def cmd_maintain(args: argparse.Namespace) -> int:
 def cmd_metrics(args: argparse.Namespace) -> int:
     cfg = _load(args)
     system = MemorySystem(cfg)
-    try:
-        payload = {
-            "counters": system.metrics.counters(),
-            "log_path": str(cfg.metrics_file),
-            "recent": _tail_jsonl(cfg.metrics_file, max(0, args.tail)),
-        }
-        _dump(payload)
-    finally:
-        system.close()
+    payload = {
+        "counters": system.metrics.counters(),
+        "log_path": str(cfg.metrics_file),
+        "recent": _tail_jsonl(cfg.metrics_file, max(0, args.tail)),
+    }
+    _dump(payload)
     return 0
 
 

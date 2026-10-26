@@ -96,7 +96,8 @@ class TurnResult:
 
 
 def user_id_hash(user_id: str) -> str:
-    return hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:16]
+    # errors="replace"：user_id 带孤立代理字符时也不能让 prepare/finish 抛异常
+    return hashlib.sha256(str(user_id).encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def retrieval_summary(result: RetrievalResult) -> dict:
@@ -118,7 +119,7 @@ class TurnPipeline:
         self.system = system
         self.cfg = config or system.cfg
         self.metrics: Metrics = system.metrics
-        self.parser = MemoryOutputParser(self.metrics)
+        self.parser = MemoryOutputParser(self.metrics, extraction=self.cfg.extraction)
         self.summaries = RollingSummary(self.cfg.summary_file, self.cfg.prompt)
         self._recent: dict[str, deque[tuple[str, str]]] = {}
         self._prepared: dict[str, PreparedTurn] = {}
@@ -175,6 +176,7 @@ class TurnPipeline:
             recent_turns=list(self._recent_for(key)),
             user_message=event.message,
             gate_passed=gate_passed,
+            limits=self.cfg.prompt,
         )
 
         turn_id = uuid.uuid4().hex
@@ -233,22 +235,60 @@ class TurnPipeline:
 
         # 7. 先发送回答（空正文不发空气泡）
         if sender is not None and answer.strip():
-            sender(answer)
+            try:
+                sender(answer)
+            except Exception as exc:  # 宿主发送回调失败也不能中断后续流程
+                self.metrics.event("turn.sender_fail", exc_type=type(exc).__name__)
 
-        # 8. 摘要 / 最近轮次
         key = conversation_key(prepared.event.scope, prepared.event.user_id)
-        self.summaries.update(key, prepared.event.message, answer)
-        self._recent_for(key).append((prepared.event.message, answer))
 
-        # 9. 写记忆（独立 try/except；turn_key 幂等；valence = 编码时 bot 情绪快照）
-        write_report = self.system.remember(
-            parsed.memories,
-            user_id=prepared.event.user_id,
-            scope=prepared.event.scope,
-            valence=prepared.bot_state.valence,
-            turn_key=prepared.turn_key,
-            now=now,
-        )
+        # §11 规则 5：未命中闸门的轮次不写记忆（防模型漂移/注入污染）；
+        # 闸门只约束写入，不影响检索与回答（§7）。
+        memories_to_write = parsed.memories
+        ungated = 0
+        if memories_to_write and not prepared.gate_passed and self.cfg.gate.enforce_write:
+            ungated = len(memories_to_write)
+            memories_to_write = []
+            self.metrics.event("mem_extract.ungated", count=ungated)
+
+        # turn_key 重放：不重复摘要、不重复写记忆（幂等，§2.4）
+        duplicate_turn = bool(prepared.turn_key) and self.system.store.has_turn_key(prepared.turn_key)
+
+        # 8. 摘要 / 最近轮次（独立 try；任何异常都不能影响回答）
+        if not duplicate_turn:
+            try:
+                self.summaries.update(key, prepared.event.message, answer)
+                if answer.strip():
+                    self._recent_for(key).append((prepared.event.message, answer))
+            except Exception as exc:
+                self.metrics.event("turn.finish_error", stage="summary", exc_type=type(exc).__name__)
+
+        # 9. 写记忆（独立 try/except；turn_key 幂等；valence = 本轮 LLM 调用后的情绪快照）
+        write_report = WriteReport(skipped=len(memories_to_write), turn_duplicate=duplicate_turn)
+        if duplicate_turn:
+            self.metrics.event(
+                "mem_write.turn_dup",
+                turn_key_hash=hashlib.sha256(
+                    prepared.turn_key.encode("utf-8", "replace")
+                ).hexdigest()[:16],
+            )
+        elif memories_to_write:
+            try:
+                valence = float(self.system.state(now).valence)  # §7 步骤 5b
+            except Exception:
+                valence = prepared.bot_state.valence
+            try:
+                write_report = self.system.remember(
+                    memories_to_write,
+                    user_id=prepared.event.user_id,
+                    scope=prepared.event.scope,
+                    valence=valence,
+                    turn_key=prepared.turn_key,
+                    now=now,
+                )
+            except Exception as exc:  # 写记忆失败 = 本轮无新记忆，回答照常（§11 规则 13）
+                self.metrics.event("turn.finish_error", stage="remember", exc_type=type(exc).__name__)
+                write_report = WriteReport(failed=len(memories_to_write))
 
         # 10. 被选中的记忆强化（只改内存；异常忽略）
         reinforced = 0
@@ -257,7 +297,16 @@ class TurnPipeline:
         except Exception as exc:  # 强化失败不能影响回答
             self.metrics.event("memory.reinforce_fail", exc_type=type(exc).__name__)
 
-        self.system.record_debug_raw(prepared.turn_id, raw_text)
+        # 11. 向量补算 / 调试原文：都在回答之后，失败全部吞掉
+        try:
+            self.system.ensure_vectors()
+        except Exception:
+            pass
+        try:
+            self.system.record_debug_raw(prepared.turn_id, raw_text)
+        except Exception:
+            pass
+
         duration_ms = (time.perf_counter() - started) * 1000
         self._prepared.pop(prepared.turn_id, None)
         metrics_payload = {
@@ -266,12 +315,13 @@ class TurnPipeline:
             "light_path": prepared.light_path,
             "sentinel": parsed.sentinel_found,
             "items_in": len(parsed.memories),
-            "items_out": len(parsed.memories),
+            "items_out": len(memories_to_write),
+            "ungated": ungated,
             "written_created": len(write_report.created),
             "written_merged": len(write_report.merged),
             "write_failed": write_report.failed,
             "write_skipped": write_report.skipped,
-            "turn_duplicate": write_report.turn_duplicate,
+            "turn_duplicate": write_report.turn_duplicate or duplicate_turn,
             "reinforced": reinforced,
             "retrieval_degraded": prepared.retrieval.degraded,
             "duration_ms": round(duration_ms, 3),

@@ -151,7 +151,8 @@ TurnPipeline.finish
     若整轮条目全部命中合并（没有新建），该 `turn_key` 只在进程内存中生效（每日重写后随条目持久化）。
     这是单实例、崩溃最多丢当天增量的取舍下可接受的边界。
 11. **每次写入都会尝试 embedding**：发生在「先发送 answer」之后，因此不增加用户可感延迟；
-    失败条目暂不参与语义分，由下一次检索前的 `ensure_vectors` 补算（§6.5）。
+    失败条目暂不参与语义分，由 finish 末尾与每日维护的 `ensure_vectors` 补算（§6.5）；
+    **不在 prepare/检索路径里补算**，避免宿主取 prompt 时被模型编码阻塞。
 12. **指标事件**按 §12.1 命名，另补充 `store.* / memory.* / turn.*` 便于排障；默认不记正文，
     `metrics.debug_raw=true` 时才记录 raw 前 500 字符，并在维护时清理超过 7 天的记录。
 13. **parser 的 answer 切在「最早哨兵」之前**：§4.2.3 参考实现切在「解析成功的那个哨兵」之前；
@@ -160,6 +161,27 @@ TurnPipeline.finish
     被误报为 `truncated`。
 14. **检索空候选不降级**：过滤后 0 条候选时不记 `retrieval.degraded`（空库每轮刷指标没有信息量）；
     非法 `scope` 返回空结果 + warning 而不是抛异常；单条时间戳损坏时该条 R=0、不中断检索。
+15. **§11 规则 5「写入必须过闸门」的落地**：闸门未命中的轮次，即使模型漂移输出了哨兵块也不写记忆
+    （`gate.enforce_write=true`，记 `mem_extract.ungated`）。闸门仍然只影响「写入」这一侧，
+    检索与回答按 §7 保持解耦；把 `enforce_write` 设为 false 可恢复「协议只约束提示词」的宽松口径。
+16. **压抑不产生持久后果**：检索 R 用 §5.2 的 `S_eff`（临时压低可提取性），但 dormant / archive
+    的判定用**未压抑的 R**。否则几轮回避状态就会把记忆永久降级或移档，违背「不是忘掉，是不易想起」。
+17. **降级模式的相似度语义**：无 embedding 时 `sim` = BM25 批内归一值（词面相似度，不是余弦）。
+    `max==min` 的边界：全 0 → 0；同为正分（含单候选）→ 1.0，避免「单候选永远不强化/复活」退化。
+    0.5 / 0.7 阈值在此模式下按词面相似度解释；接入真实 embedding 后恢复余弦语义。
+18. **HTTP 两阶段的时延语义**：`POST /turn/finish` 在服务端完成解析、摘要、写记忆后才返回 answer，
+    因此 HTTP 接入时「写盘耗时」在宿主发送之前；这是两阶段协议的固有边界，不是库逻辑偏差。
+    进程内的 `TurnPipeline.finish(sender=...)` 严格先调用 sender 再写盘；DB/embedding 都属于 ms 级，
+    HTTP 模式实际用户可感延迟影响很小。若未来需要严格拆分，可加 `/turn/finish-parse` + `/turn/commit`。
+19. **加载路径的防脏数据策略**：时间戳不可解析、`S` 非正/非有限 → 该行进 `memory.bad.jsonl`；
+    `S>90` 加载时 clamp 到 90（§11 规则 7）；`valence` 非有限 → 0 并 clamp 到 [-1,1]；
+    `state.json` 的 NaN/inf → 中性 + `state.stale`，`avoidance` 缺失时按 `max(0,-valence)` 回退（§5.2）。
+20. **finish 失败隔离**（§11 规则 13）：解析后的摘要 / 写记忆 / 强化 / 向量补算 / 调试原文各自独立
+    `try/except`，任何一段失败只记 `turn.finish_error`，回答照常返回；`/turn/finish` 成功后才清理
+    prepared，失败时宿主可用同一 `turn_id` 重试。`turn_key` 重放不重复摘要、不重复计数。
+21. **向量 sidecar 的维度与 id 边界**：加载用 **embedder 实际维度**校验（配置 `dim` 只是后备），
+    避免「配置 dim ≠ 模型 dim」时重启后全部向量作废；归档后重启的 `next_id` 会扫描
+    `memory.archive.jsonl`，不会重用已归档 id；archive 写入幂等，避免重试导致重复归档行。
 
 ## 7. 扩展点
 

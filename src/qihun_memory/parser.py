@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .config import ExtractionConfig
 from .metrics import Metrics
 
 log = logging.getLogger("memory")
@@ -86,8 +87,13 @@ def _clean_invisible(text: str) -> str:
 
 
 def _drop_fences(text: str) -> str:
-    """正文清洗：不可见字符 + 首尾围栏 + 残留围栏标记，再压平多余空行。"""
+    """正文清洗：不可见字符 + 控制字符 + 首尾围栏 + 残留围栏标记，再压平多余空行。"""
     text = _clean_invisible(text)
+    text = "".join(
+        ch
+        for ch in text
+        if ch in "\n\t\r" or not (ord(ch) < 32 or ord(ch) == 127 or 0x80 <= ord(ch) <= 0x9F)
+    )
     text = LEAD_FENCE_RE.sub("", text)
     text = TAIL_FENCE_RE.sub("", text)
     text = TICK_RE.sub("", text)
@@ -251,14 +257,23 @@ def _candidate_unclosed(candidate: str) -> bool:
 # 逐条校验
 # --------------------------------------------------------------------------
 
-def _clean_content(value: str) -> str:
-    """剔除控制字符（C0 + DEL），strip 后截断 500 字符。"""
-    text = "".join(ch for ch in value if ch >= " " and ch != "\x7f")
-    return text.strip()[:MAX_CONTENT]
+def _clean_content(value: str, max_content: int = MAX_CONTENT) -> str:
+    """剔除控制字符（C0 + DEL + C1）与孤立代理字符，strip 后截断。"""
+    chars: list[str] = []
+    for ch in value:
+        code = ord(ch)
+        if code < 32 or code == 127 or 0x80 <= code <= 0x9F or 0xD800 <= code <= 0xDFFF:
+            continue
+        chars.append(ch)
+    return "".join(chars).strip()[:max_content]
 
 
-def _clean_tags(raw_tags: Any) -> list[str]:
-    """tags 是 list 时取前 8 个非空串、每个 ≤16 字符；否则 []。"""
+def _clean_tags(
+    raw_tags: Any,
+    max_tags: int = MAX_TAGS,
+    max_tag_len: int = MAX_TAG_LEN,
+) -> list[str]:
+    """tags 是 list 时取前 N 个非空串、每个 ≤L 字符；否则 []。"""
     if not isinstance(raw_tags, list):
         return []
     tags: list[str] = []
@@ -269,13 +284,13 @@ def _clean_tags(raw_tags: Any) -> list[str]:
             continue
         if not text:
             continue
-        tags.append(text[:MAX_TAG_LEN])
-        if len(tags) >= MAX_TAGS:
+        tags.append(text[:max_tag_len])
+        if len(tags) >= max_tags:
             break
     return tags
 
 
-def _validate_item(item: Any) -> dict[str, Any] | None:
+def _validate_item(item: Any, limits: ExtractionConfig) -> dict[str, Any] | None:
     """单条校验；坏条返回 None（§4.2.2 第 6 步：坏条目单条丢弃）。"""
     if not isinstance(item, dict):
         return None
@@ -285,31 +300,32 @@ def _validate_item(item: Any) -> dict[str, Any] | None:
     raw_content = item.get("content")
     if not isinstance(raw_content, str):
         return None
-    content = _clean_content(raw_content)
+    content = _clean_content(raw_content, limits.max_content)
     if not content:
         return None
     # content 含哨兵串或三反引号围栏 → 丢弃该条（防注入回流，§4.2.3）
     if SENT_OPEN in content or SENT_CLOSE in content or FENCE in content:
         return None
-    return {"type": item_type, "content": content, "tags": _clean_tags(item.get("tags"))}
+    tags = _clean_tags(item.get("tags"), limits.max_tags, limits.max_tag_len)
+    return {"type": item_type, "content": content, "tags": tags}
 
 
-def _validate_items(raw_items: Any) -> tuple[list[dict], bool]:
-    """校验 + 批内去重 + 最多 5 条；返回 (条目, 是否因超限被截断)。"""
+def _validate_items(raw_items: Any, limits: ExtractionConfig) -> tuple[list[dict], bool]:
+    """校验 + 批内去重 + 最多 N 条；返回 (条目, 是否因超限被截断)。"""
     if not isinstance(raw_items, list):
         return [], False
     clean: list[dict] = []
     seen: set[tuple[str, str]] = set()
     truncated = False
     for raw_item in raw_items:
-        validated = _validate_item(raw_item)
+        validated = _validate_item(raw_item, limits)
         if validated is None:
             continue
         key = (validated["type"], validated["content"])
         if key in seen:
             continue
         seen.add(key)
-        if len(clean) >= MAX_ITEMS:
+        if len(clean) >= limits.max_items:
             truncated = True
             break
         clean.append(validated)
@@ -331,16 +347,40 @@ def _raw_hash(raw: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
+def _strip_surrogates(text: str) -> str:
+    """把孤立代理字符换成 U+FFFD；避免后续 utf-8 写盘 / 哈希抛 UnicodeEncodeError。"""
+    if not any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
+        return text
+    return "".join("\ufffd" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
+
+
+def _strip_partial_sentinel(text: str) -> str:
+    """去掉末尾被截断的哨兵前缀（如 "...<MEMORY_JS"），确保残片不发给用户。
+
+    只处理长度 ≥5 的前缀，避免误伤正文里正常的 "<MEMO" 之类文本。
+    """
+    for length in range(len(SENT_OPEN) - 1, 4, -1):
+        prefix = SENT_OPEN[:length]
+        if text.endswith(prefix):
+            return text[:-length]
+    return text
+
+
+def _clean_answer(text: str) -> str:
+    """正文清洗：去不可见字符 / 首尾围栏 / 哨兵残片，再压平空行。"""
+    return _drop_fences(_strip_partial_sentinel(text))
+
+
 def _fallback_answer(raw: str) -> str:
     """兜底口径：有哨兵取哨兵前；无哨兵剔除疑似 JSON 块；最差原样返回。"""
     try:
         positions = _sentinel_positions(raw)
         if positions:
-            return _drop_fences(raw[: positions[0]])
-        return _drop_fences(_cut_spans(raw, _candidate_spans(raw)))
+            return _clean_answer(_cut_spans(raw[: positions[0]], _candidate_spans(raw[: positions[0]])))
+        return _clean_answer(_cut_spans(raw, _candidate_spans(raw)))
     except Exception:
         try:
-            return raw.strip()
+            return _strip_partial_sentinel(raw).strip()
         except Exception:  # pragma: no cover - str.strip 不会抛，纯防御
             return ""
 
@@ -352,8 +392,13 @@ def _fallback_answer(raw: str) -> str:
 class MemoryOutputParser:
     """解析 LLM 原始输出（回答正文 + 哨兵隐藏 JSON）。"""
 
-    def __init__(self, metrics: Metrics | None = None) -> None:
+    def __init__(
+        self,
+        metrics: Metrics | None = None,
+        extraction: ExtractionConfig | None = None,
+    ) -> None:
         self.metrics = metrics
+        self.extraction = extraction or ExtractionConfig()
 
     # ---------- 公开入口 ----------
 
@@ -361,6 +406,7 @@ class MemoryOutputParser:
         """解析；任何输入都返回 ExtractResult，绝不抛异常。"""
         try:
             text = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+            text = _strip_surrogates(text)
         except Exception as exc:  # 极端输入（__str__ 抛异常）
             return self._fail(raw_text="", exc=exc, sentinel_found=False)
         sentinel_found = SENT_OPEN in text
@@ -380,7 +426,7 @@ class MemoryOutputParser:
         spans = _candidate_spans(raw)
         if not spans:
             return ExtractResult(
-                answer=_drop_fences(raw),
+                answer=_clean_answer(raw),
                 memories=[],
                 status="no_sentinel",
                 sentinel_found=False,
@@ -423,7 +469,9 @@ class MemoryOutputParser:
 
         # 回答正文 = 最早哨兵之前的全部内容（§4.2.1 硬规则 2）：
         # 即便靠后的哨兵解析成功，靠前的伪哨兵块也一并切掉，保证正文永不含隐藏 JSON。
-        answer = _drop_fences(raw[: positions[0]])
+        # 哨兵前若还有 {"memories":...} 块（模型顺序漂移），也要切掉，否则会泄给用户（B7）。
+        pre_sentinel = raw[: positions[0]]
+        answer = _clean_answer(_cut_spans(pre_sentinel, _candidate_spans(pre_sentinel)))
         if memories is None:
             self._record_bad_json(raw_len, raw_hash, exc_type)
             if unclosed:
@@ -439,7 +487,7 @@ class MemoryOutputParser:
                 raw_hash=raw_hash,
                 error=error,
             )
-        items, over_cap = _validate_items(memories)
+        items, over_cap = _validate_items(memories, self.extraction)
         truncated = unclosed or over_cap
         if truncated:
             self._record_truncated(raw_len, raw_hash)
@@ -464,7 +512,7 @@ class MemoryOutputParser:
         start, end = spans[-1]
         candidate = raw[start:end]
         # 兜底一律把所有候选块从正文里剔除（含截断残片）
-        answer = _drop_fences(_cut_spans(raw, spans))
+        answer = _clean_answer(_cut_spans(raw, spans))
         unclosed = _balanced_end(raw, start) is None
         try:
             obj = _loads_candidate(candidate)
@@ -499,7 +547,7 @@ class MemoryOutputParser:
                 raw_hash=raw_hash,
                 error="invalid_structure",
             )
-        items, over_cap = _validate_items(obj["memories"])
+        items, over_cap = _validate_items(obj["memories"], self.extraction)
         truncated = unclosed or over_cap
         if truncated:
             self._record_truncated(raw_len, raw_hash)

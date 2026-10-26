@@ -106,6 +106,9 @@ async function memoryTurn({ userId, scope, text, msgid, atBot, replyToBot }) {
    `POST /users/refresh {"members": {"123456": "昵称A"}}`（启动时 + 成员变动时）。
 4. 定时维护：每天调一次 `POST /maintain`（dormant 判定 / 死记忆移档 / 全量重写）。
 5. 私聊用 `scope=dm` + 对方 QQ 号；群聊用 `scope=group` + 说话人 QQ 号（§3.1）。
+6. **HTTP 模式时延**：`/turn/finish` 返回时服务端已完成解析与落盘，所以「写盘耗时」发生在你发送之前。
+   append 写盘是 ms 级，实际可忽略；如果未来要求严格先发后写，需要把协议拆成
+   `/turn/finish-parse`（返回 answer）+ `/turn/commit`（落盘），当前版本未做。
 
 ## 5. 观测与故障排查
 

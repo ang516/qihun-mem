@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
-import time
+import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from .config import StateConfig
@@ -57,19 +57,39 @@ def load_bot_state(
                 reason = "invalid"
             else:
                 valence = float(raw.get("valence", 0.0))
-                avoidance = float(raw.get("avoidance", 0.0))
+                # NaN/inf 不是「极端情绪」，是脏数据（§2.3 按中性处理，绝不能 clamp 成最大值）
+                if not math.isfinite(valence):
+                    reason = "invalid"
+                    valence = 0.0
+                else:
+                    valence = max(-1.0, min(1.0, valence))
+                # §5.2：没有 avoidance 字段时用 max(0, -valence) 近似
+                if raw.get("avoidance") is None:
+                    avoidance = max(0.0, -valence)
+                else:
+                    avoidance = float(raw["avoidance"])
+                    if not math.isfinite(avoidance):
+                        reason = "invalid"
+                        avoidance = 0.0
+                    else:
+                        avoidance = max(0.0, min(1.0, avoidance))
                 updated_raw = str(raw.get("updated_at") or "")
                 if not updated_raw:
                     reason = "invalid"
+                elif reason:
+                    pass
                 else:
                     updated = parse_iso(updated_raw)
                     age_hours = (current - updated).total_seconds() / 3600.0
                     if age_hours > cfg.stale_hours:
                         reason = "expired"
+                    elif age_hours < -1.0:
+                        # 时间戳在未来超过 1 小时：视为时钟/数据异常，不当成新鲜状态
+                        reason = "future"
                     else:
                         state = BotState(
-                            valence=max(-1.0, min(1.0, valence)),
-                            avoidance=max(0.0, min(1.0, avoidance)),
+                            valence=valence,
+                            avoidance=avoidance,
                             updated_at=updated.isoformat(timespec="seconds"),
                             stale=False,
                             source="file",
@@ -124,4 +144,7 @@ class UserDirectory:
 
     def save(self) -> None:
         payload = json.dumps(self._users, ensure_ascii=False, indent=2, sort_keys=True)
-        atomic_write_text(self.path, payload + "\n")
+        try:
+            atomic_write_text(self.path, payload + "\n")
+        except OSError as exc:
+            log.warning("users.json write failed (nickname refresh skipped): %r", exc)

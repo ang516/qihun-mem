@@ -267,10 +267,12 @@ class MemoryService:
         raw = payload.get("raw")
         if not turn_id:
             raise ServiceError(400, "turn_id is required")
-        prepared = self._prepared.pop(turn_id, None)
+        prepared = self._prepared.get(turn_id)
         if prepared is None:
             raise ServiceError(404, f"unknown or already finished turn: {turn_id}")
+        # 成功后才清理：finish 异常时保留该 turn，宿主可原样重试（A2）
         result = self.pipeline.finish(prepared, raw if isinstance(raw, str) else "")
+        self._prepared.pop(turn_id, None)
         return {"ok": True, **result.to_dict()}
 
     def _obsidian_notes(self) -> dict:

@@ -50,10 +50,13 @@
   },
   "prompt": {
     "summary_tokens": 200,
-    "recent_turns": 5
+    "recent_turns": 5,
+    "persona_tokens": 500,
+    "recent_tokens": 750
   },
   "gate": {
     "enabled": true,
+    "enforce_write": true,
     "extra_patterns": []
   },
   "state": {

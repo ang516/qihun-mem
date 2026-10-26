@@ -130,13 +130,19 @@ def _bm25_raw(
 
 
 def _minmax(values: Sequence[float]) -> list[float]:
-    """批内 min-max 归一化到 [0,1]；max==min（含空批）时全部为 0。"""
+    """批内 min-max 归一化到 [0,1]。
+
+    max==min 的边界：全部 0 分 → 0；全部同为正分（含只有一个候选）→ 1.0。
+    后者避免「单候选永远 sim=0、永不强化/复活」的退化（降级模式尤其明显）。
+    """
     if not values:
         return []
     low = min(values)
     high = max(values)
-    if not math.isfinite(low) or not math.isfinite(high) or high == low:
+    if not math.isfinite(low) or not math.isfinite(high):
         return [0.0] * len(values)
+    if high == low:
+        return [1.0 if high > 0 else 0.0] * len(values)
     span = high - low
     return [min(1.0, max(0.0, (value - low) / span)) for value in values]
 

@@ -83,17 +83,24 @@ class ExtractionConfig:
 
 @dataclass(frozen=True)
 class PromptConfig:
-    """§6.3 / §7 会话摘要与最近轮次。"""
+    """§6.3 / §7 会话摘要与最近轮次（§1 预算：persona ≈500 / 最近 5 轮 ≈750）。"""
 
     summary_tokens: int = 200
     recent_turns: int = 5
+    persona_tokens: int = 500
+    recent_tokens: int = 750
 
 
 @dataclass(frozen=True)
 class GateConfig:
-    """§4.1 写入闸门。"""
+    """§4.1 写入闸门。
+
+    enforce_write：§11 规则 5「写入必须过闸门」的落地开关。闸门未命中的轮次，
+    即使模型漂移输出了哨兵块也不写记忆（只影响写入，不影响检索与回答）。
+    """
 
     enabled: bool = True
+    enforce_write: bool = True
     extra_patterns: tuple[str, ...] = ()
 
 

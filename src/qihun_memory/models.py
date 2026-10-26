@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -13,6 +14,8 @@ from typing import Any, Mapping
 ALLOWED_TYPES = ("episode", "fact", "preference")
 ALLOWED_SCOPES = ("group", "dm")
 ALLOWED_STATUS = ("active", "dormant")
+# §8 硬上限：任何路径下 S 都不得超过 90 天（§11 规则 7）
+MAX_STABILITY = 90.0
 
 
 def utc_now() -> datetime:
@@ -98,20 +101,31 @@ class MemoryItem:
         tags_raw = data.get("tags")
         tags = [str(t) for t in tags_raw if str(t).strip()] if isinstance(tags_raw, list) else []
         try:
-            access_count = int(data.get("access_count") or 0)
-            mention_count = int(data.get("mention_count") or 0)
+            access_count = max(0, int(data.get("access_count") or 0))
+            mention_count = max(0, int(data.get("mention_count") or 0))
             stability = float(data.get("S") or 0.0)
             valence = float(data.get("valence") or 0.0)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"memory line has non-numeric counters: {exc}") from exc
+        # 时间戳必须可解析：坏行由 store 隔离到 memory.bad.jsonl，不能让检索/维护 500（§2.4）
+        created_at = str(data["created_at"])
+        last_access = str(data["last_access"])
+        parse_iso(created_at)
+        parse_iso(last_access)
+        if not math.isfinite(stability) or stability <= 0:
+            raise ValueError("memory line has invalid S")
+        stability = min(stability, MAX_STABILITY)  # §11 规则 7：加载路径也封顶
+        if not math.isfinite(valence):
+            valence = 0.0
+        valence = max(-1.0, min(1.0, valence))
         return cls(
             id=str(data["id"]),
             user_id=str(data["user_id"]),
             scope=scope,
             type=item_type,
             content=str(data["content"]),
-            created_at=str(data["created_at"]),
-            last_access=str(data["last_access"]),
+            created_at=created_at,
+            last_access=last_access,
             access_count=access_count,
             mention_count=mention_count,
             S=stability,
