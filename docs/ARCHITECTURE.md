@@ -210,6 +210,11 @@ TurnPipeline.finish
     本地兜底裸 JSON、服务崩溃后退避/恢复、`/maintain` 定时、摘要种子覆盖等；详见提交记录与
     `docs/INTEGRATION.md` §10。原则不变：任何失败都只降级，不阻塞聊天、不写坏数据。
 
+28. **Obsidian 只读视图导出**：设计原则「记忆系统不写 Obsidian」保持——新增的 `export-obsidian`
+    是独立、显式的导出工具（`obsidian_export.py` + CLI），把 memory.jsonl 渲染成 Markdown 镜像；
+    桥接在启动/每轮结束/每日维护后调用它（失败只 log），数据没变不重写。Obsidian 里的内容不会回流。
+    这样既保留「只读」语义，又能让人在 Obsidian 里直接看到新记忆。
+
 ## 7. 扩展点
 
 - **换 embedding**：实现 `embedding.Embedder` 并在 `get_embedder` 分支返回；向量维度改配置即可。

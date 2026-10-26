@@ -220,9 +220,20 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
   `persona_path=data/persona.md`（vault 不再是运行依赖）；`summary_tokens=500`（现网偏差）；
   `baseUrl` 留空时按 qihun host/port 推导；setup 先备份 qihun 配置、importer 180s 超时；私聊昵称不再污染
   `users.json`；注入顺序统一；日志打印原始 prompt。
-- 修复后验收：Python **284 passed**；桥接 `npm run test:qihun` **63 pass**、`test:vault` 10 pass、
+- 修复后验收：Python **291 passed**；桥接 `npm run test:qihun` **66 pass**、`test:vault` 10 pass、
   audit 41/46（5 个为本机既有环境问题）；真实环境已重部署（新桥接进程 + 新服务进程，`/health`
   `total=15`，`users.json` 含「群记忆 / 管理员」，persona 从 `data/persona.md` 读取）。
+### 10.2 Obsidian 只读视图（2026-10-26 追加）
+
+- 新增 `python -m qihun_memory.cli export-obsidian`：把 memory.jsonl 渲染成 Markdown 只读视图，
+  默认输出到 `<vault_dir>/器魂记忆/`（6 个文件，幂等、数据不变不重写）。
+- qq-bridge 已接入：启动后导出一次；每轮聊天结束（15s 防抖）与每日维护后自动刷新；
+  配置在 bridge `config.json` 的 `qihunMemory.obsidianExport`（vaultDir/subdir/minIntervalMs/onTurn）。
+- 只读边界不变：记忆系统本身不读 Obsidian；导出是显式编辑动作，Obsidian 里的修改不会回流。
+- 现网验证：`D:/AI-Agent-Vault/器魂记忆/` 已生成 6 个文件（15 条记忆），Obsidian REST API 搜索
+  「大白饭」能命中 `器魂记忆/10_群聊记忆.md`；启动导出日志 `未变 6`（幂等）。旧库根目录新增
+  `器魂记忆入口.md` 指路（旧 persona/memory/clues 保留为归档）。
+
 - 已知限制：`vaultMemory` 与 `qihunMemory` 同时开启时，pumpMux 先执行旧 vault 的 `consumeTurn`
   （会先剥掉隐藏块），导致新版 finish 拿不到哨兵、从而不写记忆。setup 默认已关闭旧 vault；
   如手工双开，请把新版 finish 放在旧 vault 之前，或只保留一个记忆层。

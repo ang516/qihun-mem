@@ -223,7 +223,24 @@ return fin.answer;   // 只发这个；不要发 raw
   确认 `python -m qihun_memory.cli --version` 可用、端口 18765 未被占用。
 - 回复变慢：看 `turn.prepare` / `turn.finish` 耗时；写盘在发送之后，理论上不影响可感延迟。
 
-## 6. Obsidian 只读
+## 6. Obsidian 只读与「记忆视图」
+
+记忆系统运行时不写 Obsidian（`obsidian.ReadOnlyObsidianVault` 只提供读方法，无任何写路径）。
+如果希望在 Obsidian 里**看到**新记忆，使用独立的只读视图导出命令（单向：记忆数据 → Markdown）：
+
+```bash
+# 默认导出到 <vault_dir>/器魂记忆/；也可 --out 指定
+python -m qihun_memory.cli export-obsidian -c config.json --out D:/AI-Agent-Vault/器魂记忆
+```
+
+生成 6 个文件：`00_器魂记忆说明` / `10_群聊记忆` / `11_私聊记忆` / `20_滚动摘要` /
+`30_用户与状态` / `40_已归档记忆`。导出是幂等的：数据没变不会重写文件，不会打扰 Obsidian。
+
+现网 qq-bridge 已自动调用：启动后导出一次，之后每轮聊天结束（15s 防抖）与每日维护后刷新；
+开关在 bridge `config.json` 的 `qihunMemory.obsidianExport`（`enabled` / `vaultDir` / `subdir`）。
+Obsidian 里的编辑不会回流到记忆数据。
+
+## 7. Obsidian 只读（MCP/CLI）
 
 ```bash
 # 只读测试：列出 / 读取 / 搜索
@@ -237,7 +254,7 @@ python -m qihun_memory.cli obsidian search 上海 -c config.json
 记忆数据由 `store.py` 直接写 `data_dir`，与 Obsidian 无关。
 旧库导入器也只读取 vault，不写入。
 
-## 7. 备份与迁移
+## 8. 备份与迁移
 
 - 需要备份的只有 `data_dir`：`memory.jsonl` + `memory.vec.jsonl` 是权威数据；
   `*.json` 与 `summary.json` 可由进程重建但建议一起备份。

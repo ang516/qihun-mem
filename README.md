@@ -10,9 +10,9 @@
 
 - 设计文档 v1.4 的全部机制已落地为 Python 包：哨兵解析 / JSONL 存储 / 遗忘强化 / 检索 / 每轮流程 /
   HTTP 适配层 / CLI；Obsidian 严格只读。
-- `python -m pytest -q` → **284 passed**，覆盖 §10.2 解析异常、§10.3 公式自检、§10.1 行为用例与端到端，
-  以及旧库导入的映射 / 幂等 / 干跑 / 坏数据 / 只读零落盘用例。
-- qq-bridge 侧新增 `qihun-memory.mjs` 适配器与一键接入脚本，自带 **63 个 node:test 用例**；
+- `python -m pytest -q` → **291 passed**，覆盖 §10.2 解析异常、§10.3 公式自检、§10.1 行为用例与端到端，
+  以及旧库导入的映射 / 幂等 / 干跑 / 坏数据 / 只读零落盘、Obsidian 只读视图导出用例。
+- qq-bridge 侧新增 `qihun-memory.mjs` 适配器与一键接入脚本，自带 **66 个 node:test 用例**；
   `npm run test:vault` 10 passed、桥接 audit 41/46（其余 5 个为本机既有环境问题，与本项目无关）。
 - 已过两轮独立代码审查（第二轮在现网跑起来后）：修复同会话 turn 映射、一键接入对运行中服务的并发写、
   finish 时状态切换的哨兵外泄、dry-run 落盘、归档后重导、at_bot 透传、服务崩溃恢复与每日维护等 P0/P1。
@@ -22,7 +22,10 @@
   提取协议），回合结束 finish 回写；服务由桥接自动拉起并每日 `/maintain`；`<MEMORY_JSON>` 在服务端与
   桥接侧（含裸 JSON / 零宽 / 截断）双层剥离，不会漏到 QQ。一键接入脚本
   `qq-bridge/scripts/setup-qihun-memory.mjs` + `一键桥接.bat`（导入前会安全停掉运行中的服务）。
-- 接入契约（HTTP / 适配器 / 导入 / 一键脚本）：[docs/INTEGRATION.md](docs/INTEGRATION.md)。
+- **Obsidian 可读**：新记忆由 `export-obsidian` 导出为只读视图（默认 `<vault>/器魂记忆/`，
+  含说明/群聊记忆/私聊记忆/滚动摘要/用户与状态/已归档）；桥接启动后、每轮聊天结束与每日维护后自动刷新，
+  数据没变就不重写文件。记忆系统本身仍**不读** Obsidian，Obsidian 只做只读镜像。
+- 接入契约（HTTP / 适配器 / 导入 / 一键脚本 / Obsidian 视图）：[docs/INTEGRATION.md](docs/INTEGRATION.md)。
 - 源码与提交记录：<https://github.com/ang516/qihun-mem>
 
 ## 核心特性
@@ -78,6 +81,7 @@ python -m qihun_memory.cli serve --data-dir ./data --port 8765
 | `metrics` | 结构化指标与最近事件 |
 | `obsidian list/read/search` | Obsidian **只读**访问 |
 | `import-legacy` | 旧 Obsidian 记忆库一次性导入（幂等 / 可 `--dry-run`） |
+| `export-obsidian` | 把记忆导出为 Obsidian 只读视图（单向镜像，幂等，可 `--out` 指定目录） |
 | `serve` | 启动本地 HTTP JSON API |
 
 通用参数：`-c/--config config.json`、`-d/--data-dir data`。

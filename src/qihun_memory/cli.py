@@ -1,5 +1,5 @@
 """命令行入口：init / status / search / list / turn / maintain / metrics /
-obsidian / import-legacy / serve。
+obsidian / import-legacy / export-obsidian / serve。
 
 库代码禁止 print；本文件是唯一允许面向用户输出的模块。
 """
@@ -15,6 +15,7 @@ from .config import Config, load_config
 from .legacy_import import LegacyVaultError, format_report, import_legacy
 from .memory import MemorySystem
 from .obsidian import ReadOnlyObsidianVault, VaultError
+from .obsidian_export import ExportError, export_obsidian_view, format_export_report
 from .pipeline import TurnEvent, TurnPipeline, retrieval_summary
 from .prompt import render_memory_block
 from .version import __version__
@@ -113,6 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
     import_p.add_argument("--force", action="store_true", help="覆盖已存在的 data/persona.md")
     import_p.add_argument("--json", action="store_true", help="输出 JSON 报告")
     import_p.set_defaults(func=cmd_import_legacy)
+
+    export_p = sub.add_parser(
+        "export-obsidian",
+        parents=[common],
+        help="把记忆导出为 Obsidian 只读视图（单向镜像，不回读）",
+    )
+    export_p.add_argument(
+        "--out", default=None, help="导出目录（默认 <vault_dir>/器魂记忆）"
+    )
+    export_p.add_argument("--json", action="store_true", help="输出 JSON 报告")
+    export_p.set_defaults(func=cmd_export_obsidian)
 
     serve_p = sub.add_parser("serve", parents=[common], help="启动本地 HTTP 服务")
     serve_p.add_argument("--host", default=None)
@@ -344,6 +356,27 @@ def cmd_import_legacy(args: argparse.Namespace) -> int:
         _dump(report)
     else:
         print(format_report(report))
+    return 0
+
+
+def cmd_export_obsidian(args: argparse.Namespace) -> int:
+    """器魂记忆 → Obsidian 只读视图（显式导出；记忆系统本身仍不写 Obsidian）。"""
+    cfg = _load(args)
+    out = args.out
+    if not out:
+        if not cfg.vault_path:
+            print("错误：未配置 vault_dir，请用 --out 指定导出目录", file=sys.stderr)
+            return 2
+        out = str(cfg.vault_path / "器魂记忆")
+    try:
+        report = export_obsidian_view(cfg, out)
+    except ExportError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        _dump(report.to_dict())
+    else:
+        print(format_export_report(report))
     return 0
 
 
