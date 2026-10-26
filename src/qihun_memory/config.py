@@ -286,11 +286,17 @@ class Config:
             self.metrics_file.parent.mkdir(parents=True, exist_ok=True)
 
 
-def load_config(path: str | Path | None = None, data_dir: str | Path | None = None) -> Config:
+def load_config(
+    path: str | Path | None = None,
+    data_dir: str | Path | None = None,
+    *,
+    ensure_dirs: bool = True,
+) -> Config:
     """载入配置。
 
     优先级：显式 `path` > 当前目录 config.json > 全默认。
     `data_dir` 参数覆盖配置文件中的 data_dir（常用于测试与临时库）。
+    `ensure_dirs=False` 时不在磁盘上创建 data/ 与 logs/（供 --dry-run 等只读场景，P1-1）。
     """
     data: dict[str, Any] = {}
     base: Path = Path.cwd()
@@ -311,5 +317,6 @@ def load_config(path: str | Path | None = None, data_dir: str | Path | None = No
         if path is None:
             base = Path.cwd()
     config = Config.from_dict(data, base_dir=base)
-    config.ensure_dirs()
+    if ensure_dirs:
+        config.ensure_dirs()
     return config

@@ -1,5 +1,5 @@
 """命令行入口：init / status / search / list / turn / maintain / metrics /
-obsidian / serve。
+obsidian / import-legacy / serve。
 
 库代码禁止 print；本文件是唯一允许面向用户输出的模块。
 """
@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from .config import Config, load_config
+from .legacy_import import LegacyVaultError, format_report, import_legacy
 from .memory import MemorySystem
 from .obsidian import ReadOnlyObsidianVault, VaultError
 from .pipeline import TurnEvent, TurnPipeline, retrieval_summary
@@ -98,6 +99,20 @@ def build_parser() -> argparse.ArgumentParser:
     obs_search = obs_sub.add_parser("search", help="只读搜索")
     obs_search.add_argument("query")
     obs_p.set_defaults(func=cmd_obsidian)
+
+    import_p = sub.add_parser(
+        "import-legacy", parents=[common], help="导入旧 Obsidian 记忆库（只读、幂等、可干跑）"
+    )
+    import_p.add_argument("--vault", required=True, help="旧 Obsidian 库根目录（只读，不会被修改）")
+    import_p.add_argument("--owner-id", required=True, help="记忆归属 user_id（群号或对方 QQ）")
+    import_p.add_argument(
+        "--owner-nickname", default="群记忆", help="写入 users.json 的昵称（默认：群记忆）"
+    )
+    import_p.add_argument("--scope", choices=["group", "dm"], default="group", help="记忆作用域")
+    import_p.add_argument("--dry-run", action="store_true", help="只统计，不写盘")
+    import_p.add_argument("--force", action="store_true", help="覆盖已存在的 data/persona.md")
+    import_p.add_argument("--json", action="store_true", help="输出 JSON 报告")
+    import_p.set_defaults(func=cmd_import_legacy)
 
     serve_p = sub.add_parser("serve", parents=[common], help="启动本地 HTTP 服务")
     serve_p.add_argument("--host", default=None)
@@ -298,6 +313,37 @@ def cmd_obsidian(args: argparse.Namespace) -> int:
     except VaultError as exc:
         print(f"读取失败：{exc}", file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_import_legacy(args: argparse.Namespace) -> int:
+    """§6：旧 Obsidian 记忆库 → v1.4 数据目录（幂等；不改写 vault）。"""
+    vault = Path(args.vault).expanduser()
+    if not vault.is_dir():
+        print(f"错误：vault 目录不存在或不可读：{vault}", file=sys.stderr)
+        return 2
+    if args.dry_run:
+        # 零落盘：--dry-run 连 data/、logs/ 目录都不创建（P1-1）
+        cfg = load_config(args.config, args.data_dir, ensure_dirs=False)
+    else:
+        cfg = _load(args)
+    try:
+        report = import_legacy(
+            cfg,
+            vault=vault,
+            owner_id=args.owner_id,
+            owner_nickname=args.owner_nickname,
+            scope=args.scope,
+            dry_run=args.dry_run,
+            force_persona=args.force,
+        )
+    except LegacyVaultError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        _dump(report)
+    else:
+        print(format_report(report))
     return 0
 
 

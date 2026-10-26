@@ -34,6 +34,7 @@ from .config import Config
 from .memory import MemorySystem
 from .obsidian import ReadOnlyObsidianVault, VaultError, vault_from_config
 from .pipeline import PreparedTurn, TurnEvent, TurnPipeline, retrieval_summary
+from .prompt import EXTRACTION_PROTOCOL
 from .version import __version__
 
 log = logging.getLogger("memory")
@@ -244,6 +245,12 @@ class MemoryService:
             nickname=str(payload.get("nickname") or ""),
         )
         prepared = self.pipeline.prepare(event)
+        # 宿主把当前昵称带进来时顺手刷新 users.json（昵称会变、user_id 不变，§2.3）
+        if event.nickname:
+            try:
+                self.system.refresh_users({event.user_id: event.nickname})
+            except Exception:  # 昵称写盘失败不影响本轮
+                log.debug("users.json refresh failed", exc_info=True)
         self._prepared[prepared.turn_id] = prepared
         while len(self._prepared) > TurnPipeline.MAX_PREPARED:
             self._prepared.pop(next(iter(self._prepared)))
@@ -253,6 +260,14 @@ class MemoryService:
             "turn_key": prepared.turn_key,
             "gate": prepared.gate_passed,
             "light_path": prepared.light_path,
+            # 给宿主（qq-bridge 等）直接使用的注入素材：不包含当前消息，避免重复喂
+            "injection": {
+                "system_prompt": prepared.prompt.system_prompt,
+                "memory_block": prepared.prompt.memory_block,
+                "summary": prepared.summary_text,
+                "protocol": EXTRACTION_PROTOCOL if prepared.gate_passed else "",
+                "memory_ids": list(prepared.prompt.memory_ids),
+            },
             "retrieval": retrieval_summary(prepared.retrieval),
             "prompt": prepared.prompt.to_dict(),
             "state": {

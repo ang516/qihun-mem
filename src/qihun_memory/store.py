@@ -58,9 +58,11 @@ class MemoryStore:
         metrics: Metrics | None = None,
         *,
         vector_dim: int | None = None,
+        read_only: bool = False,
     ) -> None:
         self.cfg = cfg
         self.metrics = metrics
+        self.read_only = bool(read_only)
         self.items: dict[str, MemoryItem] = {}
         self._seq = 0
         self._turn_keys: dict[str, str] = {}
@@ -115,14 +117,20 @@ class MemoryStore:
             report.valid += 1
             if item.turn_key:
                 self._turn_keys[item.turn_key] = item.id
-        if bad_lines:
+        if bad_lines and not self.read_only:
+            # 只读模式（--dry-run）只统计/告警，绝不写 memory.bad.jsonl（P1-1）
             report.new_bad = self._append_bad_lines(bad_lines)
-        # id 自增还要考虑已归档条目，否则归档最大 id 后重启会重用 id（B14）
-        archived_seq = max((self._seq_of(item_id) for item_id in self._archived_ids()), default=0)
+        # 归档条目：id 自增要避免重用（B14）；turn_key 也要参与幂等判定，
+        # 否则「导入→维护归档→重跑导入」会重复导入已归档条目（P1-3）。
+        archived = self._archived_records()
+        archived_seq = max((self._seq_of(item_id) for item_id, _ in archived), default=0)
         self._seq = max(
             max((self._seq_of(item_id) for item_id in self.items), default=0),
             archived_seq,
         )
+        for item_id, turn_key in archived:
+            if turn_key:
+                self._turn_keys.setdefault(turn_key, item_id)
         report.vector_loaded, report.vector_errors = self.load_vectors()
         self.loaded = True
         self.load_report = report
@@ -180,16 +188,23 @@ class MemoryStore:
         except (ValueError, IndexError):
             return 0
 
-    def _archived_ids(self) -> list[str]:
-        ids: list[str] = []
+    def _archived_records(self) -> list[tuple[str, str | None]]:
+        """归档条目 (id, turn_key)；坏行跳过（归档文件只用于 id 续号与幂等判定）。"""
+        records: list[tuple[str, str | None]] = []
         for line in self._read_lines(self.archive_path):
             if not line.strip():
                 continue
             try:
-                ids.append(str(json.loads(line)["id"]))
+                data = json.loads(line)
+                item_id = str(data["id"])
             except (ValueError, KeyError, TypeError, json.JSONDecodeError):
                 continue
-        return ids
+            turn_key = data.get("turn_key")
+            records.append((item_id, str(turn_key) if turn_key else None))
+        return records
+
+    def _archived_ids(self) -> list[str]:
+        return [item_id for item_id, _turn_key in self._archived_records()]
 
     def next_id(self) -> str:
         self._seq += 1
@@ -197,6 +212,8 @@ class MemoryStore:
 
     def append(self, item: MemoryItem) -> None:
         """追加一行（先落盘，再更新内存；失败不更新内存）。"""
+        if self.read_only:
+            raise RuntimeError("memory store is read-only")
         line = json.dumps(item.to_dict(), ensure_ascii=False, separators=(",", ":"))
         self.memory_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.memory_path, "a", encoding="utf-8", newline="\n") as handle:
@@ -209,6 +226,8 @@ class MemoryStore:
 
     def rewrite(self, items: Iterable[MemoryItem] | None = None, *, vectors: bool = True) -> None:
         """全量原子重写（每日一次 / 归档后）。"""
+        if self.read_only:
+            raise RuntimeError("memory store is read-only")
         item_list = list(items if items is not None else self.items.values())
         body = "".join(
             json.dumps(item.to_dict(), ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -228,12 +247,18 @@ class MemoryStore:
             atomic_write_text(self.vector_path, "".join(line + "\n" for line in vec_lines))
         self.items = {item.id: item for item in item_list}
         self._turn_keys = {item.turn_key: item.id for item in item_list if item.turn_key}
+        # 归档条目的 turn_key 也要保留在内存里（P1-3：重写后本进程仍能识别已导入文件）
+        for item_id, turn_key in self._archived_records():
+            if turn_key:
+                self._turn_keys.setdefault(turn_key, item_id)
 
     def archive(self, item_ids: Iterable[str]) -> int:
         """把死记忆移入 memory.archive.jsonl（不物理删除，§8 / 原则 4）。
 
         幂等：已在 archive 里的 id 不会重复追加（archive 成功但 rewrite 失败的重试场景）。
         """
+        if self.read_only:
+            raise RuntimeError("memory store is read-only")
         ids = [item_id for item_id in item_ids if item_id in self.items]
         if not ids:
             return 0
@@ -284,6 +309,8 @@ class MemoryStore:
 
     def append_vector(self, item: MemoryItem) -> bool:
         """追加向量到 sidecar；失败返回 False（该条暂不参与语义分）。"""
+        if self.read_only:
+            raise RuntimeError("memory store is read-only")
         if not item.vector:
             return False
         try:

@@ -6,14 +6,23 @@
 
 ## 当前状态
 
-**v1.4 实现完成、可接入现网**（2026-10-26）：
+**v1.4 完整落地，已接入现网 qq-bridge 并替换旧 Obsidian 记忆库**（2026-10-26）：
 
 - 设计文档 v1.4 的全部机制已落地为 Python 包：哨兵解析 / JSONL 存储 / 遗忘强化 / 检索 / 每轮流程 /
   HTTP 适配层 / CLI；Obsidian 严格只读。
-- `python -m pytest -q` → **257 passed**，覆盖 §10.2 解析异常、§10.3 公式自检、§10.1 行为用例与端到端。
-- 已过一轮独立代码审查，修复了失败隔离、闸门强制、坏数据容错、压抑持久化、向量维度等 P0/P1 问题。
-- 当前阶段：**库就绪，待接入现网 qq-bridge**（HTTP 两阶段接口与 Node 示例已就绪，
-  见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)）。
+- `python -m pytest -q` → **284 passed**，覆盖 §10.2 解析异常、§10.3 公式自检、§10.1 行为用例与端到端，
+  以及旧库导入的映射 / 幂等 / 干跑 / 坏数据 / 只读零落盘用例。
+- qq-bridge 侧新增 `qihun-memory.mjs` 适配器与一键接入脚本，自带 **63 个 node:test 用例**；
+  `npm run test:vault` 10 passed、桥接 audit 41/46（其余 5 个为本机既有环境问题，与本项目无关）。
+- 已过两轮独立代码审查（第二轮在现网跑起来后）：修复同会话 turn 映射、一键接入对运行中服务的并发写、
+  finish 时状态切换的哨兵外泄、dry-run 落盘、归档后重导、at_bot 透传、服务崩溃恢复与每日维护等 P0/P1。
+- **旧 Obsidian 记忆库已一次性导入**（12 篇 episodes + clues + 滚动摘要 + persona 状态 + 人设，
+  共 15 条记忆；导入幂等，旧库转为只读归档）。
+- **qq-bridge 已接入并运行**：`src/qihun-memory.mjs` 每轮 prepare 注入（persona + 相关记忆 + 摘要 +
+  提取协议），回合结束 finish 回写；服务由桥接自动拉起并每日 `/maintain`；`<MEMORY_JSON>` 在服务端与
+  桥接侧（含裸 JSON / 零宽 / 截断）双层剥离，不会漏到 QQ。一键接入脚本
+  `qq-bridge/scripts/setup-qihun-memory.mjs` + `一键桥接.bat`（导入前会安全停掉运行中的服务）。
+- 接入契约（HTTP / 适配器 / 导入 / 一键脚本）：[docs/INTEGRATION.md](docs/INTEGRATION.md)。
 - 源码与提交记录：<https://github.com/ang516/qihun-mem>
 
 ## 核心特性
@@ -68,6 +77,7 @@ python -m qihun_memory.cli serve --data-dir ./data --port 8765
 | `maintain` | dormant 判定、死记忆移档、全量原子重写 |
 | `metrics` | 结构化指标与最近事件 |
 | `obsidian list/read/search` | Obsidian **只读**访问 |
+| `import-legacy` | 旧 Obsidian 记忆库一次性导入（幂等 / 可 `--dry-run`） |
 | `serve` | 启动本地 HTTP JSON API |
 
 通用参数：`-c/--config config.json`、`-d/--data-dir data`。
@@ -107,7 +117,7 @@ Obsidian 相关端点只有读，没有任何写接口。
 | GET | `/metrics` | 指标计数与最近事件 |
 | GET | `/memory/list` | 列出记忆 |
 | GET | `/memory/search?q=&scope=&user_id=` | 检索（不强化） |
-| POST | `/turn/prepare` | `{user_id, scope, message, msgid?, at_bot?, reply_to_bot?}` → prompt |
+| POST | `/turn/prepare` | `{user_id, scope, message, msgid?, at_bot?, reply_to_bot?, nickname?}` → prompt + `injection`（system_prompt / memory_block / summary / protocol / memory_ids） |
 | POST | `/turn/finish` | `{turn_id, raw}` → 回答正文 + 写记忆结果 |
 | GET | `/obsidian/notes` | 列出只读库笔记 |
 | GET | `/obsidian/note?path=` | 读取笔记（只读） |
@@ -171,6 +181,7 @@ python -m pytest -q
 - 设计规范：[QiHun-Memory-System-v1.4.md](QiHun-Memory-System-v1.4.md)
 - 实现映射与决策：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - 部署与接入：[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- 现网桥接与旧库导入契约：[docs/INTEGRATION.md](docs/INTEGRATION.md)
 - 模块接口契约：[docs/INTERFACES.md](docs/INTERFACES.md)
 
 ## License

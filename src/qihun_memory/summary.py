@@ -65,6 +65,25 @@ class RollingSummary:
         self.save()
         return "\n".join(units)
 
+    def seed(self, key: str, units: list[str]) -> str:
+        """用外部内容（旧库导入）整体替换某个会话的摘要单元。
+
+        与 update 的区别：不追加「用户：/器魂：」前缀，直接采用调用方给出的
+        单元顺序；每个单元压缩成单行并裁剪到 120 字，总长超过 summary_tokens
+        预算时**从尾部**丢弃（旧库摘要按重要性排序，头部最值得保留）。
+        写入后立即 save()，返回最终生效的摘要文本。
+        """
+        cleaned: list[str] = []
+        for unit in units:
+            text = " ".join(str(unit).split())
+            if text:
+                cleaned.append(text[:_MAX_LINE_CHARS])
+        while cleaned and estimate_tokens("\n".join(cleaned)) > self.cfg.summary_tokens:
+            cleaned.pop()
+        self._data[key] = cleaned
+        self.save()
+        return "\n".join(cleaned)
+
     def reset(self, key: str) -> None:
         self._data.pop(key, None)
         self.save()

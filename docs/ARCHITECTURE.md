@@ -26,6 +26,7 @@ qihun-mem/
 │   ├── memory.py                 # §4.2.5/§4.3/§5/§6/§7 写入·遗忘·强化·维护门面
 │   ├── pipeline.py               # §7 每轮流程：prepare / finish
 │   ├── obsidian.py               # Obsidian 只读库（无写 API）
+│   ├── legacy_import.py          # 旧 Obsidian 记忆库一次性导入（只读/幂等/干跑）
 │   ├── service.py                # 本地 HTTP JSON API（宿主接入层）
 │   ├── cli.py                    # init/status/search/list/turn/maintain/...
 │   ├── metrics.py                # §12 结构化指标
@@ -123,7 +124,8 @@ TurnPipeline.finish
 | §7 每轮流程（先发后写/无空气泡/幂等） | `tests/test_pipeline.py` |
 | §12 指标 | 各测试内的 `Metrics` 断言 |
 | Obsidian 只读 | `tests/test_obsidian.py` |
-| HTTP 适配层 | `tests/test_service.py` |
+| HTTP 适配层（含 `injection` 契约） | `tests/test_service.py` |
+| 旧库导入（映射/幂等/干跑/坏数据） | `tests/test_legacy_import.py` |
 | CLI | `tests/test_cli.py` |
 
 ## 6. 实现决策与已知偏差
@@ -182,6 +184,31 @@ TurnPipeline.finish
 21. **向量 sidecar 的维度与 id 边界**：加载用 **embedder 实际维度**校验（配置 `dim` 只是后备），
     避免「配置 dim ≠ 模型 dim」时重启后全部向量作废；归档后重启的 `next_id` 会扫描
     `memory.archive.jsonl`，不会重用已归档 id；archive 写入幂等，避免重试导致重复归档行。
+22. **旧库导入走迁移通道**（`legacy_import.py`）：旧 Obsidian 库的 episodes / clues / 摘要 / 状态
+    需要保留原始时间戳与 S，因此直接构造 `MemoryItem` 写 `store`（仍受 schema 校验与原子写保护），
+    并登记 `turn_key="legacy:<vault>:<相对路径>"` 做幂等；它不经过提取闸门（导入的是人工确认过的旧数据），
+    也不写 `state.json`、不修改 vault。重复执行只做幂等跳过。
+23. **现网 persona 预算与注入约定**：设计默认 persona ≈500 tokens；旧库 `persona/core.md` 有 1937 字符，
+    为保持人格完整，现网配置把 `prompt.persona_tokens` 提到 2000，桥接侧注入上限
+    `qihunMemory.maxInjectChars=6000`（persona + 记忆块 + 摘要：超限先丢摘要再截记忆块，
+    persona 与提取协议优先保留）。导入后 `persona_path` 指向 `data/persona.md`（vault 不再是运行依赖）。
+    这是运行配置偏差，不改变库默认值。
+24. **state.json 的现网写入者**：库内仍无 state 写路径（§11 规则 9）。qq-bridge 适配器在每轮 prepare 前
+    把情感引擎快照写成 `{valence, avoidance=max(0,-valence), updated_at}`（原子写、快照为空则不写），
+    对应 §2.3「由情感系统写入」；记忆系统只读，缺失/过期按中性处理。
+25. **桥接宿主的两阶段边界**：`/turn/prepare` 新增 `injection`（system_prompt / memory_block / summary /
+    protocol / memory_ids），宿主只注入这些片段，不整段复用服务端 messages；静默/后台回合不注入不写；
+    `<MEMORY_JSON>` 在服务端 parser 与桥接适配器两层剥离（含截断开哨兵、全角、零宽、裸 JSON），任何路径都不漏到 QQ。
+    详细契约见 `docs/INTEGRATION.md`。
+26. **现网 summary 预算**：设计默认滚动摘要 ≤200 tokens；旧库导入的摘要信息密度高（6 段），200 会丢掉
+    关系温度/未了结/教训。现网运行配置把 `prompt.summary_tokens` 提到 500，并按
+    「一句话现状 → 关系温度 → 未了结 → 最近话题 → 近期事件 → 教训」的优先级装填与裁剪。
+    这是运行配置偏差，不改变库默认值。
+
+27. **独立审查后的加固**（2026-10-26）：修复同会话多回合 turn 映射（FIFO）、finish 时状态切换导致的
+    哨兵外泄、一键接入对运行中服务的并发写、dry-run 落盘、归档后重导、非日期 episode 静默丢弃、
+    本地兜底裸 JSON、服务崩溃后退避/恢复、`/maintain` 定时、摘要种子覆盖等；详见提交记录与
+    `docs/INTEGRATION.md` §10。原则不变：任何失败都只降级，不阻塞聊天、不写坏数据。
 
 ## 7. 扩展点
 

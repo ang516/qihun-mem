@@ -208,3 +208,42 @@ def test_http_end_to_end(tmp_path) -> None:
         server.server_close()
         thread.join(timeout=5)
         server.service.close()
+
+def test_turn_prepare_injection_block(tmp_path) -> None:
+    """桥接侧只读 injection：system_prompt / memory_block / summary / protocol / memory_ids。"""
+    service = make_service(tmp_path)
+    status, payload = service.handle(
+        "POST",
+        "/turn/prepare",
+        body=json.dumps(
+            {
+                "user_id": "u_1",
+                "scope": "group",
+                "message": "记住：我喜欢大白饭",
+                "at_bot": True,
+                "nickname": "鱼友A",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8"),
+    )
+    assert status == 200
+    injection = payload["injection"]
+    for key in ("system_prompt", "memory_block", "summary", "protocol", "memory_ids"):
+        assert key in injection
+    assert injection["protocol"]  # 命中闸门（at_bot）时必须附提取协议
+    assert "<MEMORY_JSON>" in injection["system_prompt"]
+    assert injection["memory_ids"] == []
+    # 昵称随 prepare 刷新
+    assert service.system.users.nickname("u_1") == "鱼友A"
+
+
+def test_turn_prepare_no_protocol_without_gate(tmp_path) -> None:
+    service = make_service(tmp_path)
+    status, payload = service.handle(
+        "POST",
+        "/turn/prepare",
+        body=json.dumps({"user_id": "u_1", "scope": "group", "message": "嗯"}).encode("utf-8"),
+    )
+    assert status == 200
+    assert payload["gate"] is False
+    assert payload["injection"]["protocol"] == ""

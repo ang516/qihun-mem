@@ -83,18 +83,28 @@ class MemorySystem:
         *,
         metrics: Metrics | None = None,
         embedder: Embedder | None = None,
+        read_only: bool = False,
     ) -> None:
         self.cfg = cfg
-        cfg.ensure_dirs()
-        self.metrics = metrics if metrics is not None else Metrics(
-            cfg.metrics_file if cfg.metrics.enabled else None,
-            enabled=cfg.metrics.enabled,
-        )
+        # 只读模式（--dry-run）：不建目录、不写 memory.bad.jsonl/日志，也不允许写记忆（P1-1）
+        self.read_only = bool(read_only)
+        if not self.read_only:
+            cfg.ensure_dirs()
+        if metrics is not None:
+            self.metrics = metrics
+        elif self.read_only:
+            self.metrics = Metrics(None, enabled=False)
+        else:
+            self.metrics = Metrics(
+                cfg.metrics_file if cfg.metrics.enabled else None,
+                enabled=cfg.metrics.enabled,
+            )
         self.embedder: Embedder = embedder if embedder is not None else get_embedder(cfg.embedding)
         self.store = MemoryStore(
             cfg,
             self.metrics,
             vector_dim=getattr(self.embedder, "dim", 0) or None,
+            read_only=self.read_only,
         )
         self.store.load()
         self.users = UserDirectory(cfg.users_file)
@@ -580,6 +590,8 @@ class MemorySystem:
 
     def close(self) -> None:
         """进程退出时重试 pending + 全量重写一次（§2：全量重写只在退出或每日一次）。"""
+        if self.read_only:
+            return
         try:
             self.retry_pending()
         except Exception:
