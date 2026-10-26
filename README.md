@@ -40,7 +40,7 @@ qihun-mem/
 ## 运行测试：
 
 ## 文档
-[**QiHun-Memory-System-v1.4.md**](QiHun-Memory-System v1.4.md)
+[**QiHun-Memory-System-v1.4.md**](qihun-mem\QiHun-Memory-System v1.4.md)
 
 ## 硬规则摘要
 
