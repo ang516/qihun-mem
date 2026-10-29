@@ -10,6 +10,7 @@ import pytest
 from qihun_memory.cli import main
 from qihun_memory.config import Config
 from qihun_memory.memory import MemorySystem
+from qihun_memory.models import utc_now_iso
 from qihun_memory.obsidian_export import ExportError, export_obsidian_view
 from qihun_memory.summary import RollingSummary
 
@@ -45,9 +46,11 @@ def seed_data(cfg: Config) -> None:
             valence=0.2,
         )
         system.users.refresh({"g1": "群记忆", "u1": "管理员"})
+        # bot_state 有 6 小时过期判定（StateConfig.stale_hours）；用当前时间写入，
+        # 避免挂钟一过 2026-10-26T20:00+08:00 就变成 expired→neutral（时间 flaky）。
         cfg.bot_state_file.write_text(
             json.dumps(
-                {"valence": 0.4, "avoidance": 0.0, "updated_at": "2026-10-26T20:00:00+08:00"},
+                {"valence": 0.4, "avoidance": 0.0, "updated_at": utc_now_iso()},
                 ensure_ascii=False,
             ),
             encoding="utf-8",

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 
-from qihun_memory.cli import main
+import pytest
+
+from qihun_memory.cli import build_parser, main
+from qihun_memory.models import utc_now
+from qihun_memory.version import __version__
 
 
 def run_cli(argv: list[str], capsys) -> tuple[int, str]:
@@ -129,3 +133,125 @@ def test_obsidian_cli(tmp_path, capsys) -> None:
     code, out = run_cli(["obsidian", "--vault", str(vault), "search", "器魂"], capsys)
     assert code == 0
     assert "persona.md" in out
+
+# ---------------------------------------------------------------------------
+# v1.5-r2：版本文案 / list 显示 affect / affect 子命令（§2.11）
+# ---------------------------------------------------------------------------
+
+def test_help_text_mentions_v15() -> None:
+    parser = build_parser()
+    assert "v1.5-r2" in parser.description
+
+
+def test_version_flag(capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert __version__ in captured.out
+
+
+def test_list_and_search_show_affect(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    raw_file = tmp_path / "raw.txt"
+    raw_file.write_text(
+        "好的，记下了。\n<MEMORY_JSON>\n"
+        + json.dumps(
+            {
+                "memories": [
+                    {
+                        "type": "episode",
+                        "content": "用户A下周三去上海出差",
+                        "affect": {"label": "anger", "intensity": 0.8},
+                        "tags": ["出差"],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        + "\n</MEMORY_JSON>\n",
+        encoding="utf-8",
+    )
+    code, _out = run_cli(
+        [
+            "turn",
+            "--data-dir",
+            str(data_dir),
+            "--user",
+            "u_1",
+            "--scope",
+            "group",
+            "--message",
+            "我下周三去上海出差",
+            "--raw-file",
+            str(raw_file),
+        ],
+        capsys,
+    )
+    assert code == 0
+
+    code, out = run_cli(["list", "--data-dir", str(data_dir)], capsys)
+    assert code == 0
+    assert "affect=anger:0.8" in out
+
+    code, out = run_cli(
+        ["search", "上海出差", "--data-dir", str(data_dir), "--scope", "group", "--json"],
+        capsys,
+    )
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["selected"][0]["affect"] == {"label": "anger", "intensity": 0.8}
+
+
+def test_affect_subcommand_get_and_decay(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    code, out = run_cli(
+        ["affect", "get", "--data-dir", str(data_dir), "--user", "u_1", "--json"], capsys
+    )
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["user_id"] == "u_1"
+    assert payload["affection"] == pytest.approx(0.5)
+    assert payload["familiarity"] == pytest.approx(0.3)
+
+    # 直接准备 user_affect.json（模拟历史状态），验证惰性衰减
+    now = utc_now().isoformat(timespec="seconds")
+    (data_dir / "user_affect.json").write_text(
+        json.dumps(
+            {
+                "u_1": {
+                    "affection": 0.6,
+                    "annoyance": 0.81,
+                    "familiarity": 0.4,
+                    "updated_at": now,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    code, out = run_cli(
+        [
+            "affect",
+            "decay",
+            "--data-dir",
+            str(data_dir),
+            "--user",
+            "u_1",
+            "--days",
+            "7",
+            "--json",
+        ],
+        capsys,
+    )
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["annoyance"] == pytest.approx(0.729)
+
+
+def test_affect_subcommand_text_output(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    code, out = run_cli(["affect", "get", "--data-dir", str(data_dir), "--user", "u_1"], capsys)
+    assert code == 0
+    assert "affection" in out
+    assert "familiarity" in out

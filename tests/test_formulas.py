@@ -100,7 +100,7 @@ def test_mood_bias_factor() -> None:
 def test_retrieval_config_defaults() -> None:
     cfg = RetrievalConfig()
     assert cfg.budget_tokens == 1200
-    assert cfg.header_tokens == 20
+    assert cfg.header_tokens == 24
     assert cfg.w_vector == pytest.approx(0.6)
     assert cfg.w_bm25 == pytest.approx(0.4)
     assert cfg.mood_bias_enabled is True

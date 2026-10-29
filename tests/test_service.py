@@ -10,6 +10,7 @@ import pytest
 
 from qihun_memory.config import Config
 from qihun_memory.service import MemoryService, ServiceError, create_server
+from qihun_memory.version import __version__
 
 
 def build_config(tmp_path, **overrides) -> Config:
@@ -247,3 +248,64 @@ def test_turn_prepare_no_protocol_without_gate(tmp_path) -> None:
     assert status == 200
     assert payload["gate"] is False
     assert payload["injection"]["protocol"] == ""
+
+# ---------------------------------------------------------------------------
+# v1.5-r2：affect / user_affect 端点 / 桥接摘要 / 版本（§2.11）
+# ---------------------------------------------------------------------------
+
+def test_item_payload_and_search_payload_include_v15_fields(tmp_path) -> None:
+    service = make_service(tmp_path)
+    service.system.remember(
+        [
+            {
+                "type": "episode",
+                "content": "用户A下周三去上海出差",
+                "affect": {"label": "anger", "intensity": 0.8},
+            }
+        ],
+        user_id="u_1",
+        scope="group",
+        valence=0.0,
+    )
+    status, listing = service.handle("GET", "/memory/list", {"scope": "group"})
+    assert status == 200
+    assert listing["items"][0]["affect"] == {"label": "anger", "intensity": 0.8}
+
+    status, search = service.handle(
+        "GET", "/memory/search", {"q": "上海出差", "scope": "group", "user_id": "u_1"}
+    )
+    assert status == 200
+    retrieval = search["retrieval"]
+    assert retrieval["bridge"] == {"hit": 0, "candidates": 0, "truncated": False}
+    assert retrieval["dedup"] == {"removed": 0, "degraded": False}
+    selected = search["selected"][0]
+    assert selected["affect"] == {"label": "anger", "intensity": 0.8}
+    assert selected["bridge"] is False
+    assert selected["source_pool"] in ("group", "dm", "bridge")
+
+
+def test_user_affect_endpoint(tmp_path) -> None:
+    service = make_service(tmp_path)
+    status, error = service.handle("GET", "/user_affect")
+    assert status == 400
+    assert error["ok"] is False
+
+    status, payload = service.handle("GET", "/user_affect", {"user_id": "u_1"})
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["user_id"] == "u_1"
+    assert payload["affection"] == pytest.approx(0.5)
+    assert payload["annoyance"] == pytest.approx(0.0)
+    assert payload["familiarity"] == pytest.approx(0.3)
+
+    service.system.affect_store.step_update("u_1", {"familiarity": 0.1})
+    status, payload = service.handle("GET", "/user_affect", {"user_id": "u_1"})
+    assert status == 200
+    assert payload["familiarity"] == pytest.approx(0.37)
+
+
+def test_health_uses_package_version(tmp_path) -> None:
+    service = make_service(tmp_path)
+    status, payload = service.handle("GET", "/health")
+    assert status == 200
+    assert payload["version"] == __version__

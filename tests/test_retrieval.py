@@ -17,7 +17,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from qihun_memory import lifecycle
-from qihun_memory.config import Config, DecayConfig, RetrievalConfig
+from qihun_memory.bridge import BridgeDecision, should_bridge
+from qihun_memory.config import BridgeConfig, Config, DecayConfig, RetrievalConfig
 from qihun_memory.embedding import Embedder, NullEmbedder
 from qihun_memory.metrics import Metrics
 from qihun_memory.models import MemoryItem, utc_now_iso
@@ -25,6 +26,9 @@ from qihun_memory.retrieval import (
     DEGRADED_EMBEDDER_UNAVAILABLE,
     DEGRADED_ENCODE_FAILED,
     DEGRADED_NO_VECTORS,
+    SOURCE_POOL_BRIDGE,
+    SOURCE_POOL_DM,
+    SOURCE_POOL_GROUP,
     RetrievalResult,
     Retriever,
     SelectedMemory,
@@ -32,8 +36,10 @@ from qihun_memory.retrieval import (
     _minmax,
     _tokenize,
     _type_bonus,
+    affect_similarity,
+    fill,
 )
-from qihun_memory.state import BotState
+from qihun_memory.state import BotState, UserAffect
 from qihun_memory.tokens import estimate_tokens
 
 NOW = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -94,6 +100,7 @@ def make_item(
     valence: float = 0.0,
     status: str = "active",
     vector: list[float] | None = None,
+    affect: dict | None = None,
 ) -> MemoryItem:
     last_access = (NOW - timedelta(days=age_days)).isoformat(timespec="seconds")
     created_at = (NOW - timedelta(days=created_age_days)).isoformat(timespec="seconds")
@@ -109,6 +116,7 @@ def make_item(
         valence=valence,
         status=status,
         vector=vector,
+        affect=affect,
     )
 
 
@@ -118,10 +126,12 @@ def make_retriever(
     retrieval: RetrievalConfig | None = None,
     decay: DecayConfig | None = None,
     metrics: Metrics | None = None,
+    bridge: BridgeConfig | None = None,
 ) -> tuple[Retriever, Config]:
     cfg = Config(
         retrieval=retrieval or RetrievalConfig(),
         decay=decay or DecayConfig(),
+        bridge=bridge or BridgeConfig(),
     )
     return Retriever(embedder if embedder is not None else NullEmbedder(), cfg, metrics), cfg
 
@@ -134,6 +144,8 @@ def search(
     scope: str = "group",
     user_id: str = "u1",
     bot_state: BotState | None = None,
+    user_affect: UserAffect | None = None,
+    last_event_affect: dict | None = None,
 ):
     return retriever.search(
         items,
@@ -142,6 +154,8 @@ def search(
         user_id=user_id,
         bot_state=bot_state,
         now=NOW,
+        user_affect=user_affect,
+        last_event_affect=last_event_affect,
     )
 
 
@@ -300,7 +314,7 @@ def test_type_bonus_ranking_and_ratios():
     scores = {entry.item.id: entry.score for entry in result.selected}
     assert scores["pref"] == pytest.approx(scores["fact"] * 1.1)
     assert scores["epi"] == pytest.approx(scores["fact"] * 0.9)
-    assert result.selected[0].header_tokens == 20
+    assert result.selected[0].header_tokens == 24  # §7.3 默认 head_per_item
 
 
 def test_type_bonus_helper_defaults_to_one():
@@ -672,3 +686,644 @@ def test_default_now_uses_current_time():
     retriever, _ = make_retriever()
     result = retriever.search([item], "上海", scope="group", user_id="u1")
     assert result.selected[0].r > 0.99
+
+# --------------------------------------------------------------------------
+# 7. bridge.should_bridge（§7.6：强词单命中 / 弱词≥2 / 弱词+实体）
+# --------------------------------------------------------------------------
+
+
+def test_should_bridge_strong_word_single_hit():
+    decision = should_bridge("刚才群里大家说的那个事你怎么看")
+    assert isinstance(decision, BridgeDecision)
+    assert decision.triggered is True
+    assert decision.strong is True
+    assert decision.reason == "strong"
+    assert decision.matched
+
+
+def test_should_bridge_weak_single_without_entity_not_triggered():
+    assert should_bridge("上次那个事").triggered is False
+    assert should_bridge("之前那样").triggered is False
+    assert should_bridge("上次那个事").reason == "none"
+
+
+def test_should_bridge_weak_two_distinct_words_triggers():
+    decision = should_bridge("之前说过那件事")
+    assert decision.triggered is True
+    assert decision.strong is False
+    assert decision.reason == "weak_count"
+
+
+def test_should_bridge_weak_plus_entity_triggers():
+    decision = should_bridge("上次上海出差怎么样")
+    assert decision.triggered is True
+    assert decision.strong is False
+    assert decision.reason == "weak_entity"
+    assert any("上海" in value for value in decision.matched)
+
+
+def test_should_bridge_entity_only_does_not_trigger():
+    assert should_bridge("上海明天天气不错").triggered is False
+    assert should_bridge("周末去杭州").triggered is False
+
+
+def test_should_bridge_disabled_and_bad_input_are_safe():
+    assert should_bridge("刚才群里说", BridgeConfig(enabled=False)).triggered is False
+    for value in (None, "", "   ", 123):
+        assert should_bridge(value).triggered is False
+    # 纯函数、无状态：同输入必得同输出
+    query = "刚才群里说过上海的事"
+    assert should_bridge(query) == should_bridge(query)
+
+
+def test_should_bridge_strong_words_are_config_driven():
+    # Lead 按 §7.6 原文在默认配置补了裸「群」；实现只按配置触发，不写死排除
+    assert should_bridge("这个群挺有意思").strong is True
+    cfg = BridgeConfig(strong_words=("群里",))
+    assert should_bridge("这个群挺有意思", cfg).triggered is False
+
+def test_should_bridge_uses_words_from_config():
+    cfg = BridgeConfig(
+        strong_words=("翻聊天记录",),
+        weak_words=("上次",),
+        entity_patterns=(r"杭州",),
+    )
+    assert should_bridge("你翻聊天记录看看", cfg).strong is True
+    assert should_bridge("上次杭州", cfg).triggered is True
+    assert should_bridge("上次", cfg).triggered is False
+
+
+# --------------------------------------------------------------------------
+# 8. fill(entries, constraints)（§7.3：injected_items / 预算 / 桥接子预算）
+# --------------------------------------------------------------------------
+
+
+def selected_entry(
+    item_id: str,
+    content: str,
+    *,
+    bridge: bool = False,
+    pool: str = SOURCE_POOL_GROUP,
+    r: float = 0.82,
+    score: float = 1.0,
+    scope: str = "group",
+) -> SelectedMemory:
+    return SelectedMemory(
+        item=make_item(item_id, content, scope=scope),
+        score=score,
+        r=r,
+        cos=0.0,
+        bm25=1.0,
+        sim=1.0,
+        bridge=bridge,
+        source_pool=pool,
+    )
+
+
+def test_fill_returns_required_shape_and_injected_fields():
+    entries = [selected_entry("m1", "短记", r=0.82)]
+    out = fill(entries, {"total": 100, "subgroup": {"bridge": 50}, "head_per_item": 10})
+    assert set(out) == {"injected_items", "truncated", "total_tokens"}
+    assert out["truncated"] is False
+    assert out["total_tokens"] == 10 + 2
+    item = out["injected_items"][0]
+    assert item["id"] == "m1"
+    assert item["content"] == "短记"
+    assert item["type"] == "fact"
+    assert item["r"] == pytest.approx(0.82)
+    assert item["bridge"] is False
+    assert item["source_pool"] == SOURCE_POOL_GROUP
+    assert item["tokens"] == 12
+    assert item["affect"] is None  # 缺失 affect 也显式给 key，9b 直接 .get 即可
+
+
+def test_fill_skips_oversized_items_without_truncating_text():
+    entries = [selected_entry("big", "记" * 30), selected_entry("small", "短记")]
+    out = fill(entries, {"total": 20, "head_per_item": 10})
+    assert [item["id"] for item in out["injected_items"]] == ["small"]
+    assert out["truncated"] is True
+    assert out["total_tokens"] == 12
+    assert out["injected_items"][0]["content"] == "短记"
+
+
+def test_fill_records_retrieval_truncated_for_total_budget(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    entries = [selected_entry("big", "记" * 30), selected_entry("small", "短记")]
+    out = fill(entries, {"total": 20, "head_per_item": 10}, metrics=metrics)
+    assert out["truncated"] is True
+    assert metrics.count("retrieval.truncated") == 1
+    assert metrics.count("group_bridge.truncated") == 0
+
+
+def test_fill_bridge_subgroup_budget_comes_from_constraints(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    entries = [
+        selected_entry("d1", "私聊记", pool=SOURCE_POOL_DM),
+        selected_entry("b1", "群聊一", bridge=True),
+        selected_entry("b2", "群聊二", bridge=True),
+    ]
+    out = fill(
+        entries,
+        {"total": 500, "subgroup": {"bridge": 20}, "head_per_item": 10},
+        metrics=metrics,
+    )
+    bridge_items = [item for item in out["injected_items"] if item["bridge"]]
+    assert [item["id"] for item in bridge_items] == ["b1"]  # b2 超出 20 的桥接子预算
+    assert out["truncated"] is True
+    assert metrics.count("group_bridge.truncated") == 1
+
+
+def test_fill_does_not_hardcode_bridge_budget(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    entries = [selected_entry("b%d" % index, "群聊内容", bridge=True) for index in range(4)]
+    # 头部 10 + 正文 4 = 14/条；子预算 25 → 只装 1 条。若装填层硬编码 300 会装下 4 条。
+    out = fill(
+        entries,
+        {"total": 1000, "subgroup": {"bridge": 25}, "head_per_item": 10},
+        metrics=metrics,
+    )
+    assert len([item for item in out["injected_items"] if item["bridge"]]) == 1
+    assert metrics.count("group_bridge.truncated") == 1
+
+
+def test_fill_without_constraints_does_not_hardcode_budget():
+    # §6.4 / D3：装填层不硬编码 1200 / head；constraints 缺省 = 不设上限、头部 0
+    out = fill([selected_entry("m1", "短记")])
+    assert out["total_tokens"] == 2
+    assert out["truncated"] is False
+
+
+# --------------------------------------------------------------------------
+# 9. 群聊混合池与 rel / user_affect 调制（§7.2 / §7.4）
+# --------------------------------------------------------------------------
+
+
+def test_group_pool_is_mixed_and_rel_marks_current_user_only():
+    items = [
+        make_item("mine", "上海出差", user_id="u1"),
+        make_item("other", "上海出差", user_id="u2"),
+    ]
+    metrics = Metrics()
+    retriever, _ = make_retriever(metrics=metrics)
+    result = search(retriever, items, "上海", scope="group", user_id="u1")
+    by_id = {entry.item.id: entry for entry in result.selected}
+    assert set(by_id) == {"mine", "other"}  # 群聊混合池：不按 user_id 预过滤
+    assert by_id["mine"].score_detail["rel"] is True
+    assert by_id["other"].score_detail["rel"] is False
+    assert metrics.count("retrieval.pool.mixed") == 1
+
+
+def test_rel_user_affect_modulation_applies_only_to_current_user():
+    items = [
+        make_item("mine", "上海出差", user_id="u1"),
+        make_item("other", "上海出差", user_id="u2"),
+    ]
+    retriever, _ = make_retriever()
+    baseline = search(retriever, items, "上海", scope="group", user_id="u1")
+    affected = search(
+        retriever,
+        items,
+        "上海",
+        scope="group",
+        user_id="u1",
+        user_affect=UserAffect(affection=1.0, annoyance=0.0, familiarity=1.0),
+    )
+    base = {entry.item.id: entry.score for entry in baseline.selected}
+    tuned = {entry.item.id: entry.score for entry in affected.selected}
+    # rel=1：type_bonus ×(1+0.1·familiarity)=1.1，再 ×(1+0.15·(affection-annoyance))=1.15
+    assert tuned["mine"] == pytest.approx(base["mine"] * 1.1 * 1.15)
+    assert tuned["other"] == pytest.approx(base["other"])
+
+
+def test_dm_pool_does_not_leak_other_users_group_memories_without_trigger():
+    items = [
+        make_item("dm1", "上海出差", scope="dm", user_id="u1"),
+        make_item("g_other", "上海出差", scope="group", user_id="u2"),
+    ]
+    retriever, _ = make_retriever()
+    result = search(retriever, items, "上海", scope="dm", user_id="u1")
+    assert ids(result) == ["dm1"]
+    assert result.bridge_hit == 0
+
+
+# --------------------------------------------------------------------------
+# 10. 私聊 → 群聊桥接（§7.6）
+# --------------------------------------------------------------------------
+
+
+def test_bridge_strong_trigger_appends_same_user_active_group_memories():
+    metrics = Metrics()
+    retriever, _ = make_retriever(metrics=metrics)
+    items = [
+        make_item("dm1", "我下周三去上海出差", scope="dm", user_id="u1"),
+        make_item("g1", "群里说下周三一起去上海出差", scope="group", user_id="u1"),
+        make_item("g2", "群里说下周三一起去上海出差", scope="group", user_id="u2"),
+        make_item(
+            "g_dormant",
+            "群里说下周三一起去上海出差",
+            scope="group",
+            user_id="u1",
+            status="dormant",
+        ),
+    ]
+    result = search(retriever, items, "刚才群里说上海出差的事", scope="dm", user_id="u1")
+    by_id = {entry.item.id: entry for entry in result.selected}
+    assert "dm1" in by_id
+    assert "g1" in by_id
+    assert by_id["g1"].bridge is True
+    assert by_id["g1"].source_pool == SOURCE_POOL_BRIDGE
+    assert "g2" not in by_id  # 别人的群聊记忆不桥接
+    assert "g_dormant" not in by_id  # 只桥接 active
+    assert result.bridge_hit == 1
+    assert metrics.count("group_bridge.triggered.strong") == 1
+    assert metrics.count("group_bridge.hit") == 1
+
+
+def test_bridge_item_scored_at_low_weight():
+    retriever, _ = make_retriever()
+    items = [
+        make_item("dm1", "我下周三去上海出差", scope="dm", user_id="u1"),
+        make_item("g1", "群里说下周三一起去上海出差", scope="group", user_id="u1"),
+    ]
+    result = search(retriever, items, "刚才群里说上海出差", scope="dm", user_id="u1")
+    by_id = {entry.item.id: entry for entry in result.selected}
+    bridge_entry = by_id["g1"]
+    detail = bridge_entry.score_detail
+    expected = detail["base"] * bridge_entry.r * detail["type_bonus"] * 0.7
+    assert bridge_entry.score == pytest.approx(expected)
+    assert detail["bridge"] == pytest.approx(0.7)
+
+
+def test_bridge_hard_rule_caps_weight_and_budget():
+    # §11 硬规则 18：即使配置越界，桥接权重 ≤0.7、子预算 ≤300
+    retriever, _ = make_retriever(bridge=BridgeConfig(weight=1.5, budget_tokens=1000))
+    items = [make_item("dm1", "私聊内容", scope="dm", user_id="u1")]
+    items.extend(
+        make_item("g%d" % index, "记" * 56, scope="group", user_id="u1")
+        for index in range(5)
+    )
+    result = search(retriever, items, "刚才群里说的事", scope="dm", user_id="u1")
+    bridge_entries = [entry for entry in result.selected if entry.bridge]
+    assert bridge_entries, result.selected
+    assert all(entry.score_detail["bridge"] == pytest.approx(0.7) for entry in bridge_entries)
+    assert sum(item["tokens"] for item in result.injected_items if item["bridge"]) <= 300
+    assert result.bridge_truncated is True
+
+def test_bridge_weak_trigger_requires_two_words_or_entity():
+    items = [
+        make_item("dm1", "普通私聊", scope="dm", user_id="u1"),
+        make_item("g1", "群里的上海行程", scope="group", user_id="u1"),
+    ]
+    retriever, _ = make_retriever()
+    single = search(retriever, items, "上次那件事", scope="dm", user_id="u1")
+    assert single.bridge_hit == 0
+    two_words = search(retriever, items, "之前说过那件事", scope="dm", user_id="u1")
+    assert two_words.bridge_hit == 1
+    entity = search(retriever, items, "上次上海的事", scope="dm", user_id="u1")
+    assert entity.bridge_hit == 1
+
+
+def test_bridge_disabled_returns_dm_pool_only():
+    retriever, _ = make_retriever(bridge=BridgeConfig(enabled=False))
+    items = [
+        make_item("dm1", "上海出差", scope="dm", user_id="u1"),
+        make_item("g1", "上海出差", scope="group", user_id="u1"),
+    ]
+    result = search(retriever, items, "刚才群里说上海出差", scope="dm", user_id="u1")
+    assert ids(result) == ["dm1"]
+    assert result.bridge_hit == 0
+
+
+def test_bridge_budget_limits_injected_bridge_items(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(
+        metrics=metrics,
+        bridge=BridgeConfig(budget_tokens=70, weight=0.7),
+    )
+    items = [make_item("dm1", "私聊内容", scope="dm", user_id="u1")]
+    items.extend(
+        make_item("g%d" % index, "群聊第%d条内容" % index, scope="group", user_id="u1")
+        for index in range(3)
+    )
+    result = search(retriever, items, "刚才群里说的事", scope="dm", user_id="u1")
+    injected_bridge = [entry for entry in result.selected if entry.bridge]
+    assert len(injected_bridge) == 2  # 每条 24+7=31 tokens，70 只装得下 2 条
+    assert result.bridge_hit == 2  # Lead 拍板：hit = 最终注入的桥接条目数
+    assert result.bridge_candidates == 3  # 去重后、进 fill 前的候选数
+    assert result.bridge_truncated is True
+    assert metrics.count("group_bridge.truncated") == 1
+    assert metrics.count("group_bridge.hit") == 1
+
+
+def test_bridge_cross_pool_dedup_prefers_exact_key(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(metrics=metrics)
+    items = [
+        make_item("dm1", "我喜欢本帮菜", scope="dm", user_id="u1"),
+        make_item("g1", "我喜欢本帮菜", scope="group", user_id="u1"),
+    ]
+    result = search(retriever, items, "刚才群里说我喜欢本帮菜", scope="dm", user_id="u1")
+    assert "g1" not in ids(result)
+    assert result.dedup_removed == 1
+    assert result.dedup_degraded is False  # dedup_key 精确命中，不算降级
+    assert metrics.count("group_bridge.dedup") == 1
+    assert result.bridge_hit == 0
+
+
+def test_bridge_cross_pool_dedup_uses_cosine_secondary():
+    embedder = FakeEmbedder(vectors={"刚才群里说上海": [1.0, 0.0, 0.0, 0.0]}, dim=4)
+    metrics = Metrics()
+    retriever, _ = make_retriever(embedder=embedder, metrics=metrics)
+    items = [
+        make_item(
+            "dm1",
+            "完全不同的私聊内容甲",
+            scope="dm",
+            user_id="u1",
+            vector=[1.0, 0.0, 0.0, 0.0],
+        ),
+        make_item(
+            "g1",
+            "完全不同的群聊内容乙",
+            scope="group",
+            user_id="u1",
+            vector=[1.0, 0.0, 0.0, 0.0],
+        ),
+    ]
+    result = search(retriever, items, "刚才群里说上海", scope="dm", user_id="u1")
+    assert "g1" not in ids(result)  # cos=1.0 > 0.9 → 二次判定为重复
+    assert result.dedup_removed == 1
+    assert result.dedup_degraded is False
+    assert metrics.count("group_bridge.dedup") == 1
+
+
+def test_bridge_cross_pool_dedup_keeps_higher_score_side():
+    # §6.2 / Lead 拍板：重复对保留 score 高者——桥接侧分数更高时去掉 dm 侧
+    retriever, _ = make_retriever()
+    items = [
+        make_item("dm1", "上海出差", scope="dm", user_id="u1", age_days=60.0),
+        make_item("g1", "上海出差", scope="group", user_id="u1", age_days=0.0),
+    ]
+    result = search(retriever, items, "刚才群里说上海出差", scope="dm", user_id="u1")
+    assert result.dedup_removed == 1
+    assert "dm1" not in ids(result)  # dm 侧 R 低 → 分数低 → 被去重
+    assert "g1" in ids(result)
+    assert result.bridge_candidates == 1
+    assert result.bridge_hit == 1
+
+def test_bridge_dedup_degrades_to_raw_text_without_vectors(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(metrics=metrics)  # NullEmbedder → 向量不可用
+    items = [
+        make_item("dm1", "相同内容", scope="dm", user_id="u1", item_type="fact"),
+        make_item("g1", "相同内容", scope="group", user_id="u1", item_type="episode"),
+    ]
+    result = search(retriever, items, "刚才群里说相同内容", scope="dm", user_id="u1")
+    # type 不同 → dedup_key 精确不命中；无向量 → 退化原文匹配命中并留痕
+    assert "g1" not in ids(result)
+    assert result.dedup_removed == 1
+    assert result.dedup_degraded is True
+    assert metrics.count("dedup.degraded") == 1
+    assert metrics.count("group_bridge.dedup") == 1
+
+
+# --------------------------------------------------------------------------
+# 11. affect_match（§7.2）
+# --------------------------------------------------------------------------
+
+
+def test_affect_similarity_matrix():
+    assert affect_similarity({"label": "joy"}, {"label": "joy"}) == 1.0
+    assert affect_similarity({"label": "joy"}, {"label": "affection"}) == 0.5
+    assert affect_similarity({"label": "anger"}, {"label": "disgust"}) == 0.5
+    assert affect_similarity({"label": "sadness"}, {"label": "sadness"}) == 1.0
+    assert affect_similarity({"label": "joy"}, {"label": "anger"}) == 0.0
+    assert affect_similarity({"label": "sadness"}, {"label": "anxiety"}) == 0.0
+    assert affect_similarity(None, {"label": "anger"}) == 0.0
+    assert affect_similarity({"label": "neutral"}, {"label": "neutral"}) == 0.0
+
+
+def test_affect_match_boost_only_when_enabled_and_event_affect_present():
+    items = [
+        make_item("anger", "上海出差", affect={"label": "anger", "intensity": 0.8}),
+        make_item("joy", "上海出差", affect={"label": "joy", "intensity": 0.8}),
+    ]
+    enabled, _ = make_retriever(
+        retrieval=RetrievalConfig(affect_match=True, gamma_a=0.1)
+    )
+    result = search(
+        enabled,
+        items,
+        "上海",
+        last_event_affect={"label": "anger", "intensity": 0.6},
+    )
+    by_id = {entry.item.id: entry for entry in result.selected}
+    assert by_id["anger"].score_detail["affect_match"] == 1.0
+    assert by_id["joy"].score_detail["affect_match"] == 0.0
+    assert by_id["anger"].score == pytest.approx(by_id["joy"].score * 1.1)
+
+    disabled, _ = make_retriever()
+    plain = search(
+        disabled,
+        items,
+        "上海",
+        last_event_affect={"label": "anger", "intensity": 0.6},
+    )
+    for entry in plain.selected:
+        assert entry.score_detail.get("affect_match") is None
+
+    no_event = search(enabled, items, "上海")
+    for entry in no_event.selected:
+        assert entry.score_detail.get("affect_match") is None
+
+
+def test_affect_bias_counts_only_rel_one_items():
+    items = [
+        make_item("mine", "上海出差", user_id="u1", affect={"label": "anger", "intensity": 0.8}),
+        make_item("other", "上海出差", user_id="u2", affect={"label": "anger", "intensity": 0.8}),
+        make_item("mine_no_affect", "上海出差", user_id="u1"),
+        make_item("mine_joy", "上海出差", user_id="u1", affect={"label": "joy", "intensity": 0.8}),
+    ]
+    retriever, _ = make_retriever(retrieval=RetrievalConfig(affect_match=True))
+    result = search(
+        retriever,
+        items,
+        "上海",
+        scope="group",
+        user_id="u1",
+        last_event_affect={"label": "anger", "intensity": 0.8},
+    )
+    assert result.affect_bias == 1  # 只有 mine(anger) 实际被加成；neutral/无 affect 不算生效
+    by_id = {entry.item.id: entry for entry in result.selected}
+    assert set(by_id) == {"mine", "other", "mine_no_affect", "mine_joy"}
+    # affect_match 本身对所有条目生效（公式无 rel 条件），指标只统计 rel=1
+    assert by_id["mine"].score == pytest.approx(by_id["other"].score)
+    assert by_id["mine_no_affect"].score_detail["affect_match"] == 0.0
+    assert by_id["mine_joy"].score_detail["affect_match"] == 0.0
+
+
+# --------------------------------------------------------------------------
+# 12. injected_items 与装填结果一致性（§7.3）
+# --------------------------------------------------------------------------
+
+
+def test_search_injected_items_match_selected_and_token_budget():
+    items = [
+        make_item("a", "上海出差", user_id="u1"),
+        make_item("b", "深圳旅游", user_id="u1"),
+    ]
+    retriever, _ = make_retriever()
+    result = search(retriever, items, "上海")
+    assert [item["id"] for item in result.injected_items] == [
+        entry.item.id for entry in result.selected
+    ]
+    assert result.tokens == sum(item["tokens"] for item in result.injected_items)
+    assert all(item["source_pool"] == SOURCE_POOL_GROUP for item in result.injected_items)
+
+# --------------------------------------------------------------------------
+# 13. 规范用例 33~46 的检索侧断言（§10.6 / §10.7）
+# --------------------------------------------------------------------------
+
+
+def read_metric_events(metrics: Metrics) -> list:
+    path = metrics.log_path
+    if path is None:
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_spec_33_group_scope_never_bridges():
+    metrics = Metrics()
+    retriever, _ = make_retriever(metrics=metrics)
+    items = [
+        make_item("g1", "上海出差", user_id="u1"),
+        make_item("dm1", "上海出差", scope="dm", user_id="u1"),
+    ]
+    result = search(retriever, items, "刚才群里说上海出差", scope="group", user_id="u1")
+    assert result.bridge_hit == 0
+    assert metrics.count("group_bridge.triggered.strong") == 0
+    assert ids(result) == ["g1"]  # 群聊检索永远不读 dm 记忆（硬规则 18）
+
+
+def test_spec_36_bridge_budget_truncates_to_subgroup_limit(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(metrics=metrics)
+    # 5 条桥接候选：每条 24 行头 + 56 正文 = 80 tokens（累计 400）；子预算 300 → 只装 3 条
+    items = [
+        make_item("g%d" % index, "记" * 56, scope="group", user_id="u1")
+        for index in range(5)
+    ]
+    result = search(retriever, items, "刚才群里说的事", scope="dm", user_id="u1")
+    injected = [item for item in result.injected_items if item["bridge"]]
+    assert len(injected) == 3
+    bridge_tokens = sum(item["tokens"] for item in injected)
+    assert bridge_tokens == 240
+    assert bridge_tokens <= 300
+    assert result.tokens <= 1200
+    assert result.bridge_candidates == 5  # 去重后 5 条全部进 fill
+    assert result.bridge_hit == 3  # 注入 3 条（≤300 tokens）
+    assert result.bridge_truncated is True
+    assert metrics.count("group_bridge.truncated") == 1
+
+
+def test_spec_37_cross_pool_dedup_two_pairs(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(metrics=metrics)
+    items = [
+        make_item("dm1", "事实甲", scope="dm", user_id="u1"),
+        make_item("dm2", "事实乙", scope="dm", user_id="u1"),
+        make_item("g1", "事实甲", scope="group", user_id="u1"),
+        make_item("g2", "事实乙", scope="group", user_id="u1"),
+        make_item("g3", "群里独特的新事实", scope="group", user_id="u1"),
+    ]
+    result = search(retriever, items, "刚才群里说的事实", scope="dm", user_id="u1")
+    assert result.dedup_removed == 2
+    assert result.bridge_candidates == 1  # 去重后只剩 1 条桥接候选
+    assert result.bridge_hit == 1
+    events = [event for event in read_metric_events(metrics) if event["event"] == "group_bridge.dedup"]
+    assert len(events) == 1
+    assert events[0]["count"] == 2
+    assert metrics.count("dedup.degraded") == 1
+
+
+def test_spec_38_familiarity_and_user_affect_modulation_numbers():
+    items = [
+        make_item("mine", "上海出差", user_id="u1"),
+        make_item("other", "上海出差", user_id="u2"),
+    ]
+    retriever, _ = make_retriever()
+    baseline = search(retriever, items, "上海", scope="group", user_id="u1")
+    tuned = search(
+        retriever,
+        items,
+        "上海",
+        scope="group",
+        user_id="u1",
+        user_affect=UserAffect(affection=0.9, annoyance=0.1, familiarity=0.8),
+    )
+    base = {entry.item.id: entry.score for entry in baseline.selected}
+    tuned_scores = {entry.item.id: entry.score for entry in tuned.selected}
+    assert tuned_scores["mine"] == pytest.approx(base["mine"] * 1.08 * 1.12)
+    assert tuned_scores["other"] == pytest.approx(base["other"])
+
+
+def test_spec_46_degradation_chain_metrics_appear(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(metrics=metrics)  # NullEmbedder：向量不可用
+    items = [
+        make_item("dm1", "相同内容", scope="dm", user_id="u1", item_type="fact"),
+        make_item("g1", "相同内容", scope="group", user_id="u1", item_type="episode"),
+    ]
+    result = search(retriever, items, "刚才群里说相同内容", scope="dm", user_id="u1")
+    assert result.degraded is True
+    assert result.dedup_removed == 1
+    assert result.dedup_degraded is True
+    assert metrics.count("retrieval.degraded") == 1
+    assert metrics.count("group_bridge.hit") == 1
+    assert metrics.count("dedup.degraded") == 1
+    assert result.injected_items  # 回答路径可用：dm 池仍正常注入
+
+
+def test_search_records_retrieval_truncated_metric(tmp_path):
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(
+        metrics=metrics,
+        retrieval=RetrievalConfig(budget_tokens=25, header_tokens=20),
+    )
+    items = [make_item("fit", "短记忆内容"), make_item("big", "记" * 20)]
+    result = search(retriever, items, "")
+    assert ids(result) == ["fit"]  # 20+5 恰好 25；大条目跳过
+    assert metrics.count("retrieval.truncated") == 1
+
+def test_spec_43_dedup_and_bridge_truncation_coexist(tmp_path):
+    # 用例 43：2 对同事实，dm 侧分数更低被去重；桥接侧 5 条仍占 400 tokens → 截断
+    metrics = Metrics(log_path=tmp_path / "metrics.jsonl")
+    retriever, _ = make_retriever(metrics=metrics)
+    bridge_contents = ["上海出差第%d条" % index + "记" * 49 for index in range(5)]
+    items = [
+        make_item("dm_dup_%d" % index, bridge_contents[index], scope="dm", user_id="u1", age_days=60.0)
+        for index in range(2)
+    ]
+    items.extend(
+        make_item("g_%d" % index, bridge_contents[index], scope="group", user_id="u1")
+        for index in range(5)
+    )
+    result = search(retriever, items, "刚才群里说上海出差", scope="dm", user_id="u1")
+    assert result.dedup_removed == 2  # dm 侧低分条目被去重
+    assert result.bridge_candidates == 5  # 桥接侧 5 条全部保留进 fill
+    assert result.bridge_truncated is True  # 5 × 80 = 400 > 300
+    assert result.bridge_hit == 3
+    assert result.tokens <= 1200
+    events = read_metric_events(metrics)
+    dedup_events = [event for event in events if event["event"] == "group_bridge.dedup"]
+    truncated_events = [
+        event for event in events if event["event"] == "group_bridge.truncated"
+    ]
+    assert len(dedup_events) == 1 and dedup_events[0]["count"] == 2
+    assert len(truncated_events) == 1
+
+

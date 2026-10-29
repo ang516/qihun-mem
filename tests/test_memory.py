@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import timedelta
 
 import pytest
 
+from qihun_memory.config import Config
+from qihun_memory.embedding import Embedder
+from qihun_memory.lifecycle import compute_S
 from qihun_memory.memory import MemorySystem
-from qihun_memory.models import MemoryItem, utc_now, utc_now_iso
+from qihun_memory.models import Inc, MemoryItem, Set, utc_now, utc_now_iso
+from qihun_memory.retrieval import RetrievalResult
+from qihun_memory.state import UserAffect
 
 
 def make_item(system: MemorySystem, **overrides) -> MemoryItem:
@@ -286,3 +292,374 @@ def test_metrics_snapshot(system) -> None:
     snapshot = system.stats()
     assert snapshot["counts"]["total"] == 1
     assert "embedder" in snapshot
+
+# ---------------------------------------------------------------------------
+# v1.5-r2：状态单点 update_memory(Set/Inc)（附录 D1 / 用例 23~25）
+# ---------------------------------------------------------------------------
+
+def make_system(tmp_path, *, embedder=None, **overrides) -> MemorySystem:
+    data = {
+        "data_dir": str(tmp_path / "data"),
+        "embedding": {"enabled": False, "backend": "none", "dim": 8},
+    }
+    data.update(overrides)
+    cfg = Config.from_dict(data, base_dir=tmp_path)
+    cfg.ensure_dirs()
+    if embedder is not None:
+        return MemorySystem(cfg, embedder=embedder)
+    return MemorySystem(cfg)
+
+
+class FakeEmbedder(Embedder):
+    """确定性假编码器：按文本查表返回 L2 归一化向量。"""
+
+    name = "fake"
+    dim = 4
+
+    def __init__(self, mapping: dict[str, list[float]] | None = None, *, available: bool = True) -> None:
+        self.mapping = dict(mapping or {})
+        self._available = available
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def encode(self, texts):
+        vectors = []
+        for index, text in enumerate(texts):
+            vector = list(self.mapping.get(text) or [0.0, 0.0, 0.0, 0.0])
+            if not any(vector):
+                vector[index % 4] = 1.0
+            norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+            vectors.append([value / norm for value in vector])
+        return vectors
+
+
+def seed_item(system: MemorySystem, **overrides) -> MemoryItem:
+    item = make_item(system, **overrides)
+    system.store.append(item)
+    return item
+
+
+def test_update_memory_set_whitelist_and_clamp(system) -> None:
+    item = seed_item(system, S=7.0)
+    assert system.update_memory(item.id, Set("S", 12.5)) is True
+    assert item.S == pytest.approx(12.5)
+    assert system.update_memory(item.id, [Set("S", 100.0)]) is True
+    assert item.S == pytest.approx(90.0)  # §11 规则 7：写入路径也 clamp 90
+    assert system.update_memory(item.id, Set("status", "dormant")) is True
+    assert item.status == "dormant"
+    assert system.update_memory(item.id, Set("last_access", "2026-01-02T03:04:05+00:00")) is True
+    assert item.last_access == "2026-01-02T03:04:05+00:00"
+    assert system.metrics.count("state.write_guard") == 0
+
+
+def test_update_memory_inc_reads_old_value(system) -> None:
+    item = seed_item(system, access_count=3, mention_count=1)
+    assert system.update_memory(item.id, [Inc("access_count"), Inc("mention_count", 2)]) is True
+    assert item.access_count == 4  # Inc 内部读旧值（用例 24）
+    assert item.mention_count == 3
+    assert system.update_memory(item.id, Inc("access_count", 1)) is True
+    assert item.access_count == 5
+
+
+@pytest.mark.parametrize(
+    "ops",
+    [
+        [Set("content", "改写正文")],
+        [Set("valence", -1.0)],
+        [Set("created_at", "2026-01-01T00:00:00+00:00")],
+        [Set("affect", {"label": "joy", "intensity": 0.5})],
+        [Set("unknown_field", 1)],
+        [Inc("access_count", "1")],
+        [Inc("S")],
+        ["not-an-op"],
+    ],
+)
+def test_update_memory_rejects_non_whitelist(system, ops) -> None:
+    item = seed_item(system)
+    before = item.to_dict()
+    assert system.update_memory(item.id, ops) is False
+    assert item.to_dict() == before  # 整体不生效（用例 25 / A2）
+    assert system.metrics.count("state.write_guard") == 1
+
+
+def test_update_memory_invalid_values_are_atomic(system) -> None:
+    item = seed_item(system)
+    assert system.update_memory(item.id, [Set("status", "dormant"), Set("S", "NaN")]) is False
+    assert item.status == "active"  # 前一项也不能生效
+    assert system.metrics.count("state.write_guard") == 1
+    assert system.update_memory("m_missing", Set("S", 1.0)) is False
+    assert system.metrics.count("state.write_guard") == 2
+
+
+# ---------------------------------------------------------------------------
+# v1.5-r2：remember 的 affect / compute_S("init") / dedup_key / pending
+# ---------------------------------------------------------------------------
+
+def test_remember_persists_affect_and_modulates_s(tmp_path) -> None:
+    system = make_system(tmp_path)
+    report = system.remember(
+        [
+            {
+                "type": "fact",
+                "content": "用户A对方案有点生气",
+                "affect": {"label": "anger", "intensity": 0.8},
+            }
+        ],
+        user_id="u_1",
+        scope="group",
+        valence=0.9,
+    )
+    item = report.created[0]
+    assert item.affect == {"label": "anger", "intensity": 0.8}
+    expected = compute_S(
+        "init",
+        "fact",
+        valence=0.9,
+        affect={"label": "anger", "intensity": 0.8},
+    )
+    assert item.S == pytest.approx(expected)
+    assert item.S == pytest.approx(53.94)  # 30*(1+0.5*0.9)*(1+0.3*0.8)
+    line = system.cfg.memory_file.read_text(encoding="utf-8").strip()
+    assert json.loads(line)["affect"] == {"label": "anger", "intensity": 0.8}
+
+
+def test_remember_invalid_affect_drops_field_not_item(tmp_path) -> None:
+    system = make_system(tmp_path)
+    report = system.remember(
+        [{"type": "episode", "content": "用户A去上海", "affect": {"label": "bogus", "intensity": 1}}],
+        user_id="u_1",
+        scope="group",
+        valence=0.0,
+    )
+    assert len(report.created) == 1
+    assert report.created[0].affect is None
+    assert report.created[0].S == pytest.approx(7.0)  # k_a 不生效
+
+
+def test_dedup_key_exact_match_merges(system) -> None:
+    first = system.remember([extracted("用户A下周三去上海出差！")], user_id="u_1", scope="group", valence=0.0)
+    assert len(first.created) == 1
+    report = system.remember([extracted("用户A下周三去上海出差!")], user_id="u_1", scope="group", valence=0.0)
+    assert len(report.created) == 0
+    assert len(report.merged) == 1
+    assert report.merged[0].mention_count == 2
+    assert report.merged[0].access_count == 0  # 重复提及不是召回
+    assert len(system.all_items()) == 1
+    assert system.metrics.count("memory.deduped") == 1
+
+
+def test_dedup_cosine_merges_when_key_differs(tmp_path) -> None:
+    embedder = FakeEmbedder(
+        {
+            "用户A下周三去上海出差": [1.0, 0.0, 0.0, 0.0],
+            "用户A下周二去上海出差": [1.0, 0.0, 0.0, 0.0],
+        }
+    )
+    system = make_system(tmp_path, embedder=embedder)
+    first = system.remember([extracted("用户A下周三去上海出差")], user_id="u_1", scope="group", valence=0.0)
+    assert len(first.created) == 1
+    report = system.remember([extracted("用户A下周二去上海出差")], user_id="u_1", scope="group", valence=0.0)
+    assert len(report.merged) == 1
+    assert report.merged[0].mention_count == 2
+    assert system.metrics.count("dedup.degraded") == 0
+
+
+def test_dedup_degraded_metric_when_embedding_unavailable(system) -> None:
+    system.remember([extracted("用户A下周三去上海出差")], user_id="u_1", scope="group", valence=0.0)
+    report = system.remember([extracted("用户A喜欢吃本帮菜")], user_id="u_1", scope="group", valence=0.0)
+    assert len(report.created) == 1
+    assert system.metrics.count("dedup.degraded") >= 1
+
+
+def test_pending_replay_skips_existing_turn_key(system, monkeypatch) -> None:
+    original_append = system.store.append
+
+    def boom(item):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(system.store, "append", boom)
+    report = system.remember(
+        [extracted()], user_id="u_1", scope="group", valence=0.0, turn_key="u_1:msg-9"
+    )
+    assert report.failed == 1
+    assert system.pending_count == 1
+    assert system.store.items == {}
+
+    monkeypatch.setattr(system.store, "append", original_append)
+    system.store.register_turn_key("u_1:msg-9", "m_9999")  # 模拟另一路径已落盘
+    outcome = system.retry_pending()
+    assert outcome["written"] == 0
+    assert outcome["skipped"] == 1
+    assert system.all_items() == []
+
+
+def test_reinforce_never_enters_pending(system) -> None:
+    seed_item(system, content="用户A下周三去上海出差")
+    result = system.search("上海出差", "group", "u_1")
+    system.reinforce(result)
+    system.affect_store.step_update("u_1", {"familiarity": 0.1})
+    assert system.pending_count == 0  # 强化 / 感情更新永不进 pending（§4.4）
+
+
+# ---------------------------------------------------------------------------
+# v1.5-r2：reinforce / revive / status 写全部经 update_memory（附录 D1）
+# ---------------------------------------------------------------------------
+
+def test_reinforce_uses_update_memory_ops(system, monkeypatch) -> None:
+    target = seed_item(system, content="用户A下周三去上海出差")
+    calls = []
+    original = system.update_memory
+
+    def spy(item_id, ops, **kwargs):
+        calls.append((item_id, list(ops) if isinstance(ops, (list, tuple)) else ops))
+        return original(item_id, ops, **kwargs)
+
+    monkeypatch.setattr(system, "update_memory", spy)
+    result = system.search("上海出差", "group", "u_1")
+    system.reinforce(result)
+    assert target.access_count == 1
+    assert target.S > 7.0
+    ops = [op for _item_id, batch in calls for op in (batch if isinstance(batch, list) else [batch])]
+    assert any(isinstance(op, Set) and op.field == "S" for op in ops)
+    assert any(isinstance(op, Inc) and op.field == "access_count" for op in ops)
+
+
+def test_revive_uses_compute_S_revive(system, monkeypatch) -> None:
+    now = utc_now_iso()
+    target = make_item(
+        system,
+        content="用户A下周三去上海出差",
+        status="dormant",
+        last_access=now,
+        S=1.0,
+    )
+    system.store.append(target)
+    calls = []
+    original = system.update_memory
+
+    def spy(item_id, ops, **kwargs):
+        calls.append((item_id, ops))
+        return original(item_id, ops, **kwargs)
+
+    monkeypatch.setattr(system, "update_memory", spy)
+    result = system.search("上海出差", "group", "u_1")
+    assert system.reinforce(result) == 1
+    assert target.status == "active"
+    assert target.S == pytest.approx(7.0)
+    batch = calls[-1][1]
+    assert Set("S", 7.0) in batch
+    assert Set("status", "active") in batch
+
+
+def test_refresh_statuses_write_goes_through_update_memory(system, monkeypatch) -> None:
+    old = (utc_now() - timedelta(days=40)).isoformat(timespec="seconds")
+    item = seed_item(system, last_access=old, S=7.0)
+    calls = []
+    original = system.update_memory
+
+    def spy(item_id, ops, **kwargs):
+        calls.append(ops)
+        return original(item_id, ops, **kwargs)
+
+    monkeypatch.setattr(system, "update_memory", spy)
+    system.search("上海出差", "group", "u_1")
+    assert item.status == "dormant"
+    assert any(
+        isinstance(ops, Set) and ops.field == "status" and ops.value == "dormant" for ops in calls
+    )
+
+
+def test_maintain_status_write_goes_through_update_memory(system, monkeypatch) -> None:
+    drowsy = seed_item(
+        system,
+        last_access=(utc_now() - timedelta(days=25)).isoformat(timespec="seconds"),
+        S=7.0,
+    )
+    calls = []
+    original = system.update_memory
+
+    def spy(item_id, ops, **kwargs):
+        calls.append(ops)
+        return original(item_id, ops, **kwargs)
+
+    monkeypatch.setattr(system, "update_memory", spy)
+    report = system.maintain()
+    assert report.dormant == 1
+    assert drowsy.status == "dormant"
+    assert any(
+        isinstance(ops, Set) and ops.field == "status" and ops.value == "dormant" for ops in calls
+    )
+
+
+# ---------------------------------------------------------------------------
+# v1.5-r2：UserAffectStore 接线（search 前 decay + 传 Retriever）
+# ---------------------------------------------------------------------------
+
+def test_search_decays_user_affect_before_retrieval(tmp_path) -> None:
+    now = utc_now()
+    system = make_system(tmp_path)
+    old = (now - timedelta(days=7)).isoformat(timespec="seconds")
+    system.cfg.user_affect_file.write_text(
+        json.dumps(
+            {
+                "u_1": {
+                    "affection": 0.5,
+                    "annoyance": 0.81,
+                    "familiarity": 0.3,
+                    "updated_at": old,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    system = make_system(tmp_path)  # 重新加载 user_affect.json
+    system.search("上海出差", "group", "u_1", now=now)
+    affect = system.affect_store.get("u_1", now)
+    assert affect.annoyance == pytest.approx(0.729)  # 0.81 * 0.9^floor(7/7)
+
+
+def test_search_passes_user_affect_and_last_event(tmp_path) -> None:
+    system = make_system(tmp_path)
+    captured: dict = {}
+
+    class RecordingRetriever:
+        def search(
+            self,
+            items,
+            query,
+            *,
+            scope,
+            user_id,
+            bot_state=None,
+            now=None,
+            user_affect=None,
+            last_event_affect=None,
+        ):
+            captured.update(
+                {
+                    "user_affect": user_affect,
+                    "last_event_affect": last_event_affect,
+                    "scope": scope,
+                    "user_id": user_id,
+                }
+            )
+            return RetrievalResult(
+                selected=[], candidates=0, tokens=0, budget=1200, degraded=False
+            )
+
+    system.retriever = RecordingRetriever()
+    system.search("查询", "group", "u_1", last_event_affect={"label": "anger", "intensity": 0.8})
+    assert isinstance(captured["user_affect"], UserAffect)
+    assert captured["last_event_affect"] == {"label": "anger", "intensity": 0.8}
+    assert captured["scope"] == "group"
+    assert captured["user_id"] == "u_1"
+
+
+def test_user_affect_helper_and_stats(system) -> None:
+    assert system.user_affect("u_1").affection == pytest.approx(0.5)
+    assert system.stats()["user_affect_users"] == 0
+    system.affect_store.step_update("u_1", {"familiarity": 0.1})
+    assert system.stats()["user_affect_users"] == 1
