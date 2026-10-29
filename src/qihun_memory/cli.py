@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="qihun-memory",
-        description="器魂记忆系统 v1.4（QiHun Memory System）",
+        description="器魂记忆系统 v1.5-r2（QiHun Memory System）",
     )
     parser.add_argument("--version", action="version", version=f"qihun-memory {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -69,6 +69,24 @@ def build_parser() -> argparse.ArgumentParser:
     list_p.add_argument("--limit", type=int, default=50)
     list_p.add_argument("--json", action="store_true")
     list_p.set_defaults(func=cmd_list)
+
+    affect_p = sub.add_parser(
+        "affect", parents=[common], help="查看/衰减用户感情状态（user_affect 单点）"
+    )
+    affect_sub = affect_p.add_subparsers(dest="affect_action", required=True)
+    affect_get = affect_sub.add_parser("get", parents=[common], help="查看用户感情快照")
+    affect_get.add_argument("--user", required=True, help="user_id")
+    affect_get.add_argument("--json", action="store_true")
+    affect_get.set_defaults(func=cmd_affect)
+    affect_decay = affect_sub.add_parser(
+        "decay", parents=[common], help="惰性衰减 annoyance（0.9^floor(days/7)，stale 归零）"
+    )
+    affect_decay.add_argument("--user", required=True, help="user_id")
+    affect_decay.add_argument(
+        "--days", type=float, default=None, help="距上次更新的天数（默认按 updated_at 计算）"
+    )
+    affect_decay.add_argument("--json", action="store_true")
+    affect_decay.set_defaults(func=cmd_affect)
 
     turn_p = sub.add_parser("turn", parents=[common], help="执行一轮（无 --raw 时只打印 prompt）")
     turn_p.add_argument("--user", required=True)
@@ -190,13 +208,20 @@ def cmd_search(args: argparse.Namespace) -> int:
                         "r": round(entry.r, 6),
                         "sim": round(entry.sim, 6),
                         "content": entry.item.content,
+                        "affect": dict(entry.item.affect) if entry.item.affect is not None else None,
+                        "bridge": bool(getattr(entry, "bridge", False)),
+                        "source_pool": str(getattr(entry, "source_pool", "") or ""),
                     }
                     for entry in result.selected
                 ],
             }
         )
     else:
-        block = render_memory_block(result.selected, system.users)
+        # 注入格式优先消费 fill 的 injected_items（含 affect / 桥接标记）
+        entries = getattr(result, "injected_items", None)
+        if not entries:
+            entries = result.selected
+        block = render_memory_block(entries, system.users)
         print(block if block else "（无命中）")
         print(f"\n候选 {result.candidates} 条，注入 {len(result.selected)} 条，{result.tokens}/{result.budget} tokens，degraded={result.degraded}")
     return 0
@@ -217,12 +242,39 @@ def cmd_list(args: argparse.Namespace) -> int:
         _dump([item.to_dict() for item in items])
     else:
         for item in items:
+            affect_text = ""
+            if item.affect is not None:
+                affect_text = (
+                    f"  affect={item.affect.get('label')}:{item.affect.get('intensity')}"
+                )
             print(
                 f"{item.id}  {item.type:<10} {item.status:<8} S={item.S:6.2f}  "
-                f"{item.user_id}  {item.content}"
+                f"{item.user_id}  {item.content}{affect_text}"
             )
         if not items:
             print("（空）")
+    return 0
+
+
+def cmd_affect(args: argparse.Namespace) -> int:
+    """用户感情状态单点（user_affect.json）的只读查看 / 惰性衰减。"""
+    system = MemorySystem(_load(args))
+    user = args.user
+    if args.affect_action == "decay":
+        affect = system.affect_store.decay(user, args.days)
+    else:
+        affect = system.affect_store.get(user)
+    if args.json:
+        payload = affect.to_dict()
+        payload["user_id"] = user
+        _dump(payload)
+    else:
+        print(f"user_id：{user}")
+        print(f"  affection   {affect.affection:.3f}")
+        print(f"  annoyance   {affect.annoyance:.3f}")
+        print(f"  familiarity {affect.familiarity:.3f}")
+        print(f"  updated_at  {affect.updated_at or '（无）'}")
+        print(f"  stale       {affect.stale}")
     return 0
 
 
@@ -329,7 +381,7 @@ def cmd_obsidian(args: argparse.Namespace) -> int:
 
 
 def cmd_import_legacy(args: argparse.Namespace) -> int:
-    """§6：旧 Obsidian 记忆库 → v1.4 数据目录（幂等；不改写 vault）。"""
+    """§6：旧 Obsidian 记忆库 → v1.5-r2 数据目录（幂等；不改写 vault）。"""
     vault = Path(args.vault).expanduser()
     if not vault.is_dir():
         print(f"错误：vault 目录不存在或不可读：{vault}", file=sys.stderr)

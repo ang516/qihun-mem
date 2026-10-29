@@ -113,7 +113,7 @@ def _header(frontmatter_type: str, snapshot: str) -> str:
     return (
         "---\n"
         f"type: {frontmatter_type}\n"
-        "source: qihun-memory-v1.4\n"
+        "source: qihun-memory-v1.5-r2\n"
         "readonly: true\n"
         f"snapshot: {snapshot}\n"
         "---\n\n"
@@ -272,7 +272,7 @@ def _render_archived(items: list[MemoryItem], users, now: datetime) -> str:
 def _render_readme(cfg: Config, report: ExportReport, snapshot: str, counts: dict[str, int]) -> str:
     body = [_header("qihun-memory-readme", snapshot), "# 器魂记忆 · 只读视图", ""]
     body += [
-        "> 本目录由**器魂记忆系统 v1.4** 自动导出，只读镜像；**不要手改**，修改不会回流到记忆数据。",
+        "> 本目录由**器魂记忆系统 v1.5-r2** 自动导出，只读镜像；**不要手改**，修改不会回流到记忆数据。",
         "> 权威数据在 qq-bridge 的 `state/qihun-memory/data/`（memory.jsonl / summary.json / users.json / state.json）。",
         "",
         "## 怎么看",

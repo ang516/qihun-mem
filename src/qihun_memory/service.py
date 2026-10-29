@@ -9,6 +9,7 @@
 端点：
   GET  /health
   GET  /state
+  GET  /user_affect?user_id=
   GET  /metrics
   GET  /memory/list?scope=&user_id=&status=&limit=
   GET  /memory/search?q=&scope=&user_id=
@@ -114,6 +115,8 @@ class MemoryService:
             }
         if path == "/state" and method == "GET":
             return 200, self._state_payload()
+        if path == "/user_affect" and method == "GET":
+            return 200, self._user_affect_payload(query)
         if path == "/metrics" and method == "GET":
             return 200, {"ok": True, "metrics": self.system.metrics.snapshot()}
         if path == "/memory/list" and method == "GET":
@@ -175,6 +178,17 @@ class MemoryService:
             "reason": state.reason,
         }
 
+    def _user_affect_payload(self, query: dict[str, str]) -> dict:
+        """用户感情快照（唯一入口 UserAffectStore.get；不做隐式 decay）。"""
+        user_id = (query.get("user_id") or "").strip()
+        if not user_id:
+            raise ServiceError(400, "user_id is required")
+        affect = self.system.affect_store.get(user_id)
+        payload = affect.to_dict()
+        payload["user_id"] = user_id
+        payload["ok"] = True
+        return payload
+
     def _list_memories(self, query: dict[str, str]) -> dict:
         scope = (query.get("scope") or "").strip()
         user_id = (query.get("user_id") or "").strip()
@@ -206,9 +220,20 @@ class MemoryService:
         if scope not in ("group", "dm"):
             raise ServiceError(400, "scope must be group or dm")
         result = self.system.search(text, scope, user_id)
+        summary = retrieval_summary(result)
+        # §2.11：search payload 增加 bridge / dedup 摘要（与检索指标同名同源）
+        summary["bridge"] = {
+            "hit": int(getattr(result, "bridge_hit", 0) or 0),
+            "candidates": int(getattr(result, "bridge_candidates", 0) or 0),
+            "truncated": bool(getattr(result, "bridge_truncated", False)),
+        }
+        summary["dedup"] = {
+            "removed": int(getattr(result, "dedup_removed", 0) or 0),
+            "degraded": bool(getattr(result, "dedup_degraded", False)),
+        }
         return {
             "ok": True,
-            "retrieval": retrieval_summary(result),
+            "retrieval": summary,
             "selected": [
                 {
                     "id": entry.item.id,
@@ -220,6 +245,9 @@ class MemoryService:
                     "cos": round(entry.cos, 6),
                     "bm25": round(entry.bm25, 6),
                     "status": entry.item.status,
+                    "affect": dict(entry.item.affect) if entry.item.affect is not None else None,
+                    "bridge": bool(getattr(entry, "bridge", False)),
+                    "source_pool": str(getattr(entry, "source_pool", "") or ""),
                 }
                 for entry in result.selected
             ],
@@ -323,6 +351,8 @@ class MemoryService:
             "valence": round(item.valence, 6),
             "status": item.status,
             "tags": list(item.tags),
+            # §2.11 / §3.1：affect 事件级标签（缺失时为 None，老数据兼容）
+            "affect": dict(item.affect) if item.affect is not None else None,
         }
 
     # ------------------------------------------------------------------

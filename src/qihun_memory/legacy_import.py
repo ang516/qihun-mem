@@ -1,4 +1,4 @@
-"""旧 Obsidian 记忆库 → v1.4 数据目录的一次性导入（docs/INTEGRATION.md §6）。
+"""旧 Obsidian 记忆库 → v1.5-r2 数据目录的一次性导入（docs/INTEGRATION.md §6）。
 
 契约要点：
 - 只读旧库（例如 D:/AI-Agent-Vault），绝不修改 vault 下任何文件，也不写 state.json；
