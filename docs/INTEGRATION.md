@@ -1,9 +1,9 @@
-# 器魂记忆系统 v1.5-r2 · 现网桥接与旧库导入契约
+# 器魂记忆系统 v1.6-rc4 · 现网桥接与旧库导入契约
 
 本文件是 qihun-mem 与 qq-bridge 两侧并行开发的唯一契约。任何改动先改本文件再改代码。
-设计规范（当前权威）：[../QiHun-Memory-System-v1.5-r2.md](../QiHun-Memory-System-v1.5-r2.md)。
-本文件 §1~§10 为 v1.4 起沿用的接入主契约；§11 是 v1.5-r2 增量（user_affect / 桥接 / 指标），
-两者同时有效。
+设计规范（当前权威）：[../QiHun-Memory-System-v1.6-rc4.md](../QiHun-Memory-System-v1.6-rc4.md)。
+本文件 §1~§10 为 v1.4 起沿用的接入主契约；§11 是 v1.5-r2 增量（user_affect / 桥接 / 指标）；
+§12 是 v1.6-rc4 增量（叙事层日记 / 预算 3850 / E1/E4/E5）；三者同时有效。
 
 ## 1. 目标
 
@@ -139,7 +139,7 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
 
 | 旧库 | type | user_id | S | 内容 |
 |---|---|---|---|---|
-| episodes/*.md（排除 _模板） | episode | owner-id | `min(90, 7*(1+0.5*|valence|)*{1:1.0,2:1.3,3:1.6})` | `日期 事件：标题。发生了什么（+以后要记得）` ≤500 字 |
+| episodes/*.md（排除 _模板） | episode | owner-id | `min(90, 7*(1+0.5*\|valence\|)*{1:1.0,2:1.3,3:1.6})` | `日期 事件：标题。发生了什么（+以后要记得）` ≤500 字 |
 | clues/*.md（排除 index） | fact | owner-id | 30 | `线索 slug：一句话。已确认：...` ≤500 字 |
 | memory/summaries/current_summary.md | fact | owner-id | 60 | `旧库滚动摘要（截至日期）：一句话现状/关系温度/未了结…` ≤500 字（模板空摘要跳过） |
 | persona/state.json | fact | owner-id | 60 | `旧库关系状态：阶段…，粘人x/傲娇y/亲密度z/馋饭w（截至日期）` |
@@ -254,7 +254,7 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
 
 - `GET /user_affect?user_id=<id>`（只读）：返回该用户的感情快照
   `{affection, annoyance, familiarity, updated_at, stale}`；未记录时返回初值。**没有写接口**。
-- `GET /health` 版本号随包版本（0.2.0 / v1.5-r2）。
+- `GET /health` 版本号随包版本（v1.5-r2 为 0.2.0；v1.6-rc4 起为 0.3.0，见 §12.1）。
 - `/memory/list`、`/memory/search` 的 item payload 增加 `affect`；search 额外返回：
   - `retrieval.bridge = {hit, candidates, truncated}`：`hit`=最终注入桥接条数，`candidates`=去重后进 fill 前候选数；
   - `retrieval.dedup = {removed, degraded}`：`removed`=跨池去重删除的重复对数（去重发生在打分之后）。
@@ -279,8 +279,101 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
 
 ### 11.3 验收（v1.5-r2 追加）
 
-- Python：`python -m pytest -q` 全绿（L1~L4 + A/B）；`python -m qihun_memory.cli --version` → `qihun-memory 0.2.0`（对应规范 v1.5-r2）。
-- 服务：`GET /user_affect?user_id=` 200；`GET /health` version=0.2.0；prepare/search 含 affect 与 bridge 摘要。
+- Python：`python -m pytest -q` 全绿（L1~L4 + A/B）；`python -m qihun_memory.cli --version` → `qihun-memory 0.2.0`（v1.5-r2 当时；v1.6-rc4 起为 0.3.0）。
+- 服务：`GET /user_affect?user_id=` 200；`GET /health` version=0.2.0（v1.5-r2 当时）；prepare/search 含 affect 与 bridge 摘要。
 - 桥接：真实私聊一轮后 `/metrics` 出现 `turn.finish`；若触发桥接，`group_bridge.triggered.*`、
   `group_bridge.hit` 可见；回复不含 `<MEMORY_JSON>` / 裸 JSON。
 - 兼容：老数据（无 affect / 无 user_affect.json）导入后正常检索与写入（用例 45）。
+
+## 12. v1.6-rc4 增量契约（叠加在 §1~§11 之上）
+
+### 12.1 服务端新增 / 变化
+
+- `GET /health` 版本号随包版本 **0.3.0**，并返回 `diary` 计数（无叙事层时为空 dict）。
+- **叙事层端点（v1.6 新增）**：日记只提供人格语境，不参与事实层检索 / 打分 / S/R / per-user 记忆。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/diary/list?scope=&limit=` | `{ok,total,counts,items:[{id,date,scope_tag,content,tokens,turn_range,created_at}]}`；created_at 倒序，limit 1~200 默认 50 |
+| GET | `/diary/excerpts?scope=` | `{ok,scope_tag,injected,tokens,truncated,excerpts:[...]}`；scope 必填 group/dm |
+| POST | `/diary/prepare` | `{scope, force?}` → `{ok, diary_id, scope_tag, due, date, turn_range, reason, prompt}`；worker 不可用 → 503 |
+| POST | `/diary/finish` | `{diary_id, raw}` → `{ok, scope_tag, status, reason, entry_id, tokens}`；未知 diary_id → 404；raw 非字符串 → 400 |
+
+- `/turn/prepare` 的 `injection` **新增 `diary_block`**（【近期日记】块，可能为空串）与
+  `diary_tokens`（本轮日记节选估算 tokens）；原有 `system_prompt / memory_block / summary /
+  protocol / memory_ids` 语义不变。宿主优先从 `injection.diary_block` 取日记注入；若宿主不想自己拼，
+  也可直接使用响应里的 `prompt.messages`（已含摘要 / 日记 / 记忆 / 最近轮 / 当前消息）。
+  注入总预算 3850 在服务端保证；超限时服务端会先丢日记、再丢检索、再丢最近轮。
+- `/turn/finish` 返回值不变；写回顺序（8a→8b→9a→9b→10）由服务端保证；
+  v1.6 非重复 turn 会额外调用日记 worker 的 `record_turn`（仅内存计数，失败只记指标）。
+- `POST /maintain` 追加「日记 30 天移档」与日记全量重写；服务启动后会补偿执行一次。
+- E1 / E4 / E5 是**服务端内部语义修正**（mention_count 新建 0、去重只比对 active、复活优先），
+  HTTP 请求 / 响应结构不变，宿主无需适配。
+
+### 12.2 桥接侧（qq-bridge）必须遵守
+
+1. **日记由宿主触发**：服务端不调用 LLM。宿主在每日 `diary.daily_at`（默认 23:50，Asia/Shanghai）
+   对 `group` / `dm` 各跑一次 `POST /diary/prepare` → 宿主 LLM → `POST /diary/finish`；
+   启动后若已过当日 23:50，做一次补偿（服务端 `due()` 幂等，不会重复落盘）。
+   任一步失败只 log，不阻塞聊天。
+2. **注入 `diary_block`**：prepare 注入块顺序建议 persona → 摘要 → 日记 → 相关记忆 → 提取协议，
+   总长仍受 `maxInjectChars` 限制；不要把日记内容放进系统指令区。
+3. **不碰 diary.jsonl**：日记只由服务端 `DiaryStore` 读写；桥接不得读写
+   `data/diary.jsonl / diary.archive.jsonl / diary.bad.jsonl`。
+4. **静默 / 后台回合**：不注入、不写记忆、不记录日记 turn、不触发日记 generation。
+5. **叙事层失败不降回答可用性**：日记生成 / 注入失败时宿主照常回复（硬规则 19）。
+6. **指标透传**：建议在桥接日志透出 `diary.inject / diary.fail / prompt.budget_over` 摘要；
+   服务端 `GET /metrics` 仍是权威来源。
+7. **桥接方向不变**：仍只允许「群聊池 → 私聊上下文」单向桥接；群聊检索禁止任何 dm 记忆；
+   裸「群」强词过触发按 rc4 §0.1 推迟到 v1.7，宿主不要依赖该行为做功能。
+8. **反向断层话术只定态度**：群聊不引用私聊内容；用户追问时 bot 只回应「私聊的事不方便在群里说」。
+   宿主不需要实现任何 dm → 群聊的查询/拼接/注入，也不得把私聊内容注入群聊回合。
+   该句已写入默认人设（`qihun_memory.cli.DEFAULT_PERSONA` 与 `examples/persona.example.md`，
+   通过 `init` 生成 `persona.md` 的部署天然生效）；宿主沿用该人设即可。
+
+### 12.2.1 qihun 运行时配置增量
+
+```json
+{
+  "prompt": {
+    "total_tokens": 3850,
+    "summary_tokens": 200,
+    "recent_turns": 5,
+    "persona_tokens": 500,
+    "recent_tokens": 750,
+    "diary_tokens": 300,
+    "protocol_tokens": 300,
+    "system_misc_tokens": 600
+  },
+  "diary": {
+    "enabled": true,
+    "trigger": "daily",
+    "every_n": 50,
+    "daily_at": "23:50",
+    "timezone": "Asia/Shanghai",
+    "max_tokens": 300,
+    "inject_budget": 300,
+    "inject_count": 2,
+    "retain_days": 30,
+    "max_per_scope": 30,
+    "privacy_check": true,
+    "bot_nickname": ""
+  }
+}
+```
+
+- 两节都可整节省略走默认值；现网 `persona_tokens=2000` / `summary_tokens=500` 之类的运行偏差保留时，
+  请确认 `total_tokens` 仍覆盖实际分项（服务端会在组装前实测，超限按顺序截断并记 `prompt.budget_over`）。
+- `diary.bot_nickname` 建议填 bot 当前群名片/昵称（生成时用于把自身昵称替换为「我」）。
+
+### 12.3 验收（v1.6-rc4 追加）
+
+- Python：`python -m pytest -q` 全绿（L1~L4 + A/B + D 叙事层）；
+  `python -m qihun_memory.cli --version` → `qihun-memory 0.3.0`（对应规范 v1.6-rc4）。
+- 服务：`GET /health` version=0.3.0 且含 `diary` 计数；
+  `/turn/prepare` 的 injection 含 `diary_block`；
+  `/diary/list`、`/diary/excerpts`、`/diary/prepare`、`/diary/finish` 全链路可用。
+- 日记：真实跑一次两阶段（CLI 或 HTTP），`diary.jsonl` 新增一行且 `content` 不含他人昵称；
+  重复调用同 turn_range / 当日同 scope → `diary.dup` 不写。
+- 兼容：老数据（无 diary / 无新 prompt 配置）升级后正常检索与写入；回滚见
+  [UPGRADE-CONTRACT-v1.6-rc4.md](UPGRADE-CONTRACT-v1.6-rc4.md) §5。
