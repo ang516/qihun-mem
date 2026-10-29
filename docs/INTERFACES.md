@@ -1,7 +1,8 @@
-# 接口契约（冻结）
+# 接口契约（v1.5-r2 冻结）
 
-本文件是模块之间的**接口约定**，实现时必须严格遵守；修改契约需要 Lead 同意。
-设计规范：仓库根目录 `QiHun-Memory-System-v1.4.md`。
+本文件是模块之间的**接口约定**，实现时必须严格遵守；修改契约必须先更新本文件并同步设计规范。
+设计规范（当前权威）：[../QiHun-Memory-System-v1.5-r2.md](../QiHun-Memory-System-v1.5-r2.md)；
+工程契约：[UPGRADE-CONTRACT-v1.5-r2.md](UPGRADE-CONTRACT-v1.5-r2.md)。
 
 ## 1. 工程约定
 
@@ -10,159 +11,149 @@
 - 日志统一用 `logging.getLogger("memory")`；库代码禁止 `print`。
 - 不允许网络访问；不允许在 import 时做重 I/O。
 - 时间一律 UTC ISO-8601（`models.utc_now_iso()`），解析用 `models.parse_iso()`。
-- 数据 schema 以 §2.1 为准；字段名不得改动。
-- 每个模块只改自己的文件（见任务 write scope），不要动其他人的文件。
+- 数据 schema 以规范 §2.1 为准；字段名不得改动。
+- 模块之间以本文件为接口边界，不得绕过公共入口直接访问其他模块内部状态。
 
-## 2. 已有基础模块（Lead 维护，不要修改）
+## 2. 基础模块
 
 ### `models.py`
+
+- `ALLOWED_TYPES = ("episode","fact","preference")`；`ALLOWED_SCOPES = ("group","dm")`；
+  `ALLOWED_STATUS = ("active","dormant")`；`MAX_STABILITY = 90.0`。
+- `ALLOWED_AFFECT_LABELS = ("joy","sadness","anger","anxiety","affection","disgust","neutral")`；
+  `JOY_AFFECT_LABELS = {"joy","affection"}`；`ANGER_AFFECT_LABELS = {"anger","disgust"}`。
 - `MemoryItem` 字段：`id, user_id, scope, type, content, created_at, last_access,
-  access_count, mention_count, S, valence, status, tags, turn_key=None, vector=None`。
-- `vector` 是运行时字段（`list[float] | None`），**不写 JSONL**，由 `memory.vec.jsonl` 装载。
-- `ALLOWED_TYPES = ("episode","fact","preference")`，`ALLOWED_SCOPES = ("group","dm")`。
-- `to_dict()` / `from_dict()`、`created_dt` / `last_access_dt` 属性可直接用。
-- `parse_iso(value) -> datetime`（无时区按 UTC）。
+  access_count, mention_count, S, valence, status, tags, turn_key=None, affect=None, vector=None`。
+  - `vector` 是运行时字段（`list[float] | None`），**不写 JSONL**，由 `memory.vec.jsonl` 装载。
+  - `to_dict()` 在 `affect` 非空时输出该键；`from_dict()` 对非法 affect 容忍（置 None，不抛）。
+- `sanitize_affect(value) -> dict | None`：label 非法 / intensity 非数字 / 非有限 → None；
+  intensity 越界 clamp [0,1] 并 round(...,6)；返回只含 `label/intensity` 两个键。
+- `affect_label(affect) -> str`、`affect_intensity(affect) -> float`：安全读取，缺失 → neutral / 0.0。
+- `Set(field, value)` / `Inc(field, delta=1)`：`update_memory` 的白名单操作符（frozen dataclass）。
+- `parse_iso(value) -> datetime`（无时区按 UTC）；`utc_now()` / `utc_now_iso()`。
 
 ### `config.py`
-- `Config`（frozen dataclass）字段：`data_dir, vault_dir, persona_path, embedding,
-  decay, retrieval, extraction, prompt, gate, state, metrics, service`。
-- 嵌套配置类：`EmbeddingConfig, DecayConfig, RetrievalConfig, ExtractionConfig,
-  PromptConfig, GateConfig, StateConfig, MetricsConfig, ServiceConfig`（默认值 = §8）。
-- `load_config(path=None, data_dir=None) -> Config`。
+
+- `Config`（frozen dataclass）字段：`data_dir, vault_dir, persona_path, embedding, decay, retrieval,
+  affect, bridge, extraction, prompt, gate, state, metrics, service`。
+- `AffectConfig`：`initial_affection=0.5, initial_annoyance=0.0, initial_familiarity=0.3,
+  step_alpha=0.1, stale_days=30.0, annoyance_decay_base=0.9, annoyance_decay_period_days=7.0`。
+- `BridgeConfig`：`enabled=True, weight=0.7, budget_tokens=300`，以及 `strong_words / weak_words /
+  entity_patterns`（见规范 §8.4）。
+- `DecayConfig` 新增 `ka=0.3`；`RetrievalConfig` 新增 `header_tokens=24, gamma_u=0.15,
+  familiarity_eta=0.1, affect_match=False, gamma_a=0.1`。
+- 路径属性：`user_affect_file`、`affect_bad_file`、`memory_file`、`vector_file`、`bad_file`、
+  `archive_file`、`summary_file`、`bot_state_file`、`users_file`、`metrics_file`。
+- `load_config(path=None, data_dir=None,ensure_dirs=True) -> Config`。
 
 ### `tokens.py`
+
 - `estimate_tokens(text: str) -> int`：CJK 1 token/字，其余 4 字符/token（确定性）。
 
 ### `lifecycle.py`
-- `retention(age_days, stability_days) -> float`：`exp(-Δt/S)`。
-- `effective_stability(item, avoidance_now, cfg: DecayConfig) -> float`：§5.2 压抑调制 S_eff。
-- `retention_now(item, *, now, avoidance_now=0.0, cfg=None) -> float`：含压抑的当前 R。
-- `initial_stability(item_type, valence, cfg) -> float`：§4.3 `S0(type)·(1+k_v·|valence|)`，cap 90。
-- `revive_stability(item_type, cfg) -> float`：中性 S0。
-- `reinforce_stability(stability, r, cfg) -> float`：`min(S·(1+R), 90)`。
-- `clamp_stability(stability, cfg) -> float`。
-- `mood_consistency(current_valence, item_valence) -> float`：同号 1.0 / 异号 0.0 / 任一侧 0 → 0.5。
-- `mood_bias_factor(current_valence, item_valence, beta) -> float`：`1 + β(2A−1)`。
+
+```python
+compute_S(mode, type, valence=0.0, affect=None, S=None, R=None, cfg: DecayConfig | None = None) -> float
+```
+
+- `init`：`S0·(1 + k_v·|valence|)`，affect 非 neutral 再乘 `(1 + k_a·intensity)`，cap 90。
+- `revive`：裸 S0（episode 7 / fact|preference 30），cap 90。
+- `reinforce`：`min(S + S·(1+R), 90)`（r1 冻结公式；S=7、R=0.5 → 17.5）。
+- 其它 mode：抛 `ValueError`（不许静默降级，A5）。
+- 旧函数 `initial_stability / revive_stability / reinforce_stability` 保留为薄封装（内部调 `compute_S`），
+  禁止出现第二份公式。
+- 其它纯函数：`retention(age_days, stability_days)`、`effective_stability(item, avoidance_now, cfg)`、
+  `retention_now(item, *, now, avoidance_now=0.0, cfg=None)`、`clamp_stability`、
+  `mood_consistency(current_valence, item_valence)`、`mood_bias_factor(current_valence, item_valence, beta)`。
 
 ### `metrics.py`
-- `Metrics(log_path=None, enabled=True)`，方法 `event(name, **fields)` / `counters()` /
-  `count(name)` / `snapshot()` / `reset()`。事件名用 §12.1 的固定名字。
-- 事件写入失败不得抛异常（已实现）。
+
+- `Metrics(log_path=None, enabled=True)`；方法 `event(name, **fields)` / `counters()` /
+  `count(name)` / `snapshot()` / `reset()`。
+- 事件名用规范 §12.1 的固定名字；事件写入失败不得抛异常（已实现）。
 
 ### `state.py`
-- `BotState(valence, avoidance, updated_at, stale, source, reason)`。
-- `load_bot_state(path, *, cfg=None, now=None, metrics=None) -> BotState`：缺失/损坏/过期 → 中性 + stale。
-- `UserDirectory(path)`：`nickname(user_id)`、`snapshot()`、`refresh(members)`。
-
-## 3. 待实现模块 A：`src/qihun_memory/parser.py`
-
-对应规范 §4.2（哨兵协议 / 解析流水线 / 校验 / 注入防护）。
-
-### 公开接口
 
 ```python
-from dataclasses import dataclass
+BotState(valence, avoidance, updated_at, stale, source, reason)
+load_bot_state(path, *, cfg=None, now=None, metrics=None) -> BotState   # 缺失/损坏/过期 → 中性 + stale
+UserDirectory(path)  # nickname(user_id) / snapshot() / refresh(members) / save()
+```
 
+**`UserAffect` / `UserAffectStore`（v1.5，唯一写入口）**：
+
+```python
 @dataclass(frozen=True)
-class ExtractResult:
-    answer: str                          # 回答正文（= 哨兵前内容，经 _drop_fences 清洗）
-    memories: list[dict]                 # 通过校验的条目，键仅 type/content/tags
-    status: str                          # "ok" | "empty" | "bad_json" | "no_sentinel" | "fail"
-    sentinel_found: bool
-    truncated: bool = False              # 超过 5 条被截断，或候选 JSON 未闭合
-    exc_type: str | None = None
-    raw_len: int = 0
-    raw_hash: str = ""                   # sha256(raw)[:16]，空输入为 ""
-    error: str | None = None             # 仅诊断用（不含正文）
+class UserAffect:
+    affection: float = 0.5
+    annoyance: float = 0.0
+    familiarity: float = 0.3
+    updated_at: str = ""
+    stale: bool = False
 
-class MemoryOutputParser:
-    def __init__(self, metrics: Metrics | None = None) -> None: ...
-    def parse(self, raw: str | None) -> ExtractResult: ...
-
-def parse_llm_output(raw: str | None) -> tuple[str, list[dict]]: ...
-def sanitize_for_prompt(text: str) -> str: ...
+class UserAffectStore:
+    def __init__(self, path, cfg: AffectConfig | None = None, metrics: Metrics | None = None): ...
+    def load(self) -> None                 # 容错；未知字段忽略；坏文件中性 + user_affect.fail
+    def get(self, user_id, now=None) -> UserAffect       # 中性兜底；stale(≥30 天) → 中性且 familiarity=0
+    def step_update(self, user_id, deltas, *, now=None) -> UserAffect   # x += delta·(1−x)，clamp [0,1]
+    def decay(self, user_id, days=None, *, now=None) -> UserAffect      # annoyance *= 0.9^floor(days/7)
+    def save(self) -> bool                 # 原子写；失败只记指标
 ```
 
-### status 语义
+- 每轮每分量调用方只调一次（I1 / 27-rev）；`stale` 由 `updated_at` 计算，不是持久化字段。
+- 其他模块只能通过 get / step_update / decay 访问；禁止直接读写 `user_affect.json`。
 
-| status | 条件 |
-|---|---|
-| `ok` | 解析成功且 `memories` 非空（逐条校验后） |
-| `empty` | 解析成功但 0 条（含空 memories 数组） |
-| `bad_json` | 找到哨兵或 memories 候选，但 JSON 无法解析 / 顶层结构非法 |
-| `no_sentinel` | 没有哨兵，也没有 memories 候选 |
-| `fail` | 解析器内部未预期异常（已兜底，不抛） |
+## 3. `parser.py`（规范 §4.2 / §4.3 / 附录 D2）
 
-- `answer` 永久不含隐藏 JSON，包括截断残片（§4.2.2 第 2 步未闭合切到文末）。
-- 无哨兵但有候选（围栏包住的 JSON 等）：走括号平衡兜底，`sentinel_found=False`；
-  能否解析成功决定 status 为 `ok`/`empty`/`bad_json`。
-- `truncated=True` 时 metrics 记 `mem_extract.truncated`。
-- parser 自身负责记 metrics：`bad_json` 与 `fail` 各记一次（字段：`raw_len`、`raw_hash`、
-  `exc_type`）；`truncated` 记一次。`ok`/`empty`/`no_sentinel` 由调用方（pipeline）记。
-
-### 必须遵守的算法（§4.2.2，顺序不可换）
-
-1. 哨兵切分：收集所有哨兵起始位置，**从后往前**逐个尝试；闭合标签缺失则取到末尾；
-   取第一个能解析出 `memories` 列表的。
-2. 括号平衡扫描：只从 memories 起点模式扫描；字符串感知；未闭合切到文末。
-3. 有限清洗：去 BOM/零宽字符；**只剥首尾**围栏；仅当 `json.loads` 失败才在字符串外去尾逗号。
-4. `json.loads`。
-5. 顶层校验：`dict` 且 `memories` 是 `list`。
-6. 逐条校验：`type` 合法；`content` 是 `str`、剔除控制字符、strip 后非空、截断 500；
-   `tags` 是 list 时取前 8 个 str、每个 ≤16 字符，否则 `[]`；坏条单条丢弃。
-   `content` 含哨兵串或三反引号围栏 → 丢弃该条。
-7. 批内去重：同 `type` + 同 `content` 只留一条；最多 5 条。
-
-### 绝对禁止
-
-- 用正则直接抠 `{...}` 嵌套 JSON；靠三反引号分割取 JSON 的写法；
-- 解析失败时把半截 JSON 当回答返回（正文必须切掉残片）；
-- 抛出异常（`parse()` 必须永远返回 `ExtractResult`）。
-
-### 注入防护 `sanitize_for_prompt(text)`
-
-- 把哨兵起止串替换为不可被解析为哨兵的形式（如全角形式）；
-- 把三反引号围栏替换为全角或空；
-- 幂等、永不抛异常；空输入返回空串。
-
-### 测试要求（`tests/test_parser.py`）
-
-覆盖 §10.2 的 1–12、14 号用例（解析相关部分）+ 补充：
-- 纯 JSON、前置/后置解释、围栏、尾逗号、截断、正文含空对象花括号、多块取最后、
-  memories 非数组、空数组、部分坏条、注入、无哨兵兜底；
-- 性能：构造 20k 个左花括号的正文 + 合法哨兵块，`parse()` < 0.5s；
-- metrics：bad_json / fail / truncated 事件可被 `Metrics(log_path=tmp)` 观测；
-- 断言 `answer` 永不含 `"memories"` 或截断残片。
-
-## 4. 待实现模块 B：`src/qihun_memory/embedding.py` + `retrieval.py`
-
-### embedding.py（§6.5）
+### 3.1 公开接口
 
 ```python
-class EmbeddingUnavailable(RuntimeError): ...
-
-class Embedder(ABC):
-    name: str
-    dim: int
-    @property
-    def available(self) -> bool: ...
-    def encode(self, texts: Sequence[str]) -> list[list[float]]: ...  # L2 归一化向量
-
-class NullEmbedder(Embedder):   # available=False, dim=0, encode 抛 EmbeddingUnavailable
-class SentenceTransformerEmbedder(Embedder):
-    def __init__(self, model_name: str = "BAAI/bge-small-zh-v1.5",
-                 model_path: str = "", device: str = "cpu", dim: int = 512) -> None: ...
-
-def get_embedder(cfg: EmbeddingConfig) -> Embedder:
-    """backend != "sentence-transformers" 或 enabled=False → NullEmbedder；
-    否则尝试加载本地/已安装的 sentence-transformers；任何失败 → NullEmbedder（只 warning 一次）。
-    禁止联网下载：优先 model_path；model 名只在库已装且用户配置了 model 时尝试。"""
+normalize_text(text: str) -> str
+dedup_key(item: Mapping) -> tuple[str, str]
+validate_affect(item: Mapping) -> dict | None
+normalize_item(m, limits: ExtractionConfig | None = None, metrics=None) -> dict | None
+dedup_within_batch(items: list[dict]) -> list[dict]
+split_raw_candidate(raw: str | None) -> tuple[str, str | None]     # (raw_answer, candidate)
+parse_memories(candidate_json, limits=None, metrics=None) -> list[dict]
+parse_llm_output(raw: str | None) -> tuple[str, list[dict]]        # raw_answer 未清洗
+clean_answer_for_send(raw_answer: str | None) -> str               # 发送层唯一清洗点
+sanitize_for_prompt(text: str) -> str                              # 注入脱敏
 ```
 
-- `encode` 返回的每个向量必须 L2 归一化（cos_sim 退化为点积）；空输入返回 `[]`。
-- 测试不得依赖 sentence-transformers / 不得联网；用本地 FakeEmbedder 验证。
+- `MemoryOutputParser(metrics=None, extraction=None).parse(raw) -> ExtractResult` 保留兼容：
+  `ExtractResult` 增加 `raw_answer` 字段，`.answer = clean_answer_for_send(raw_answer)`；
+  `status` ∈ `ok / empty / bad_json / no_sentinel / fail`。
+- 算法顺序（规范 §4.3.1）：哨兵从后往前 → 括号平衡（字符串感知、未闭合切到文末）→ 有限清洗 →
+  `json.loads` → 顶层校验 → `normalize_item` 逐条 → `dedup_within_batch` → ≤5 条。
+- 坏条单条丢弃；affect 非法只丢字段（`mem_extract.affect_invalid`）；坏条记 `mem_extract.item_invalid`。
+- `normalize_item`：content 500、tags 8×16、content 含哨兵/围栏丢弃；item 只含 `type/content/tags[/affect]`。
+- `split_raw_candidate` 有哨兵时 `raw_answer` 一律取**最早哨兵前**；无哨兵时剔除全部候选块。
+- **边界**：解析层禁止调用 `_drop_fences`；发送层禁止调用 `_loads_candidate`；发送层函数不接收
+  memories、不导入解析内部（A6）。
+- `clean_answer_for_send`：哨兵前 → 剔候选块 → 不可见字符 / 首尾围栏 / 截断哨兵残片；最差原样；
+  永不抛异常。
+- 测试要求：§10.2 全 16 条 + §10.3 affect 17~21 + `dedup_key` 金样/property；性能（20k 左花括号 < 0.5s）；
+  metrics 事件可观测；answer 永不含 `"memories"` 或截断残片。
 
-### retrieval.py（§6.2 / §6.3）
+## 4. `bridge.py`（v1.5 新增）
+
+```python
+@dataclass(frozen=True)
+class BridgeDecision:
+    triggered: bool = False
+    strong: bool = False
+    reason: str = "none"        # disabled / strong / weak_count / weak_entity / none
+    matched: tuple[str, ...] = ()
+
+def should_bridge(query: str, cfg: BridgeConfig | None = None) -> BridgeDecision: ...
+```
+
+- 强词单命中触发；强词表含裸「群」（v1.5-r2 已知过触发，v1.6 收敛）。弱词 ≥2 或弱词 + 实体指代
+  （`entity_patterns`）触发。
+- 只收时间 / 地点 / 具体事件名词，不收日常活动动词。
+- 无 I/O、无状态；触发词表与实体表来自 `BridgeConfig`。测试不得依赖网络。
+
+## 5. `retrieval.py`（规范 §6.2~6.4 / 附录 D3）
 
 ```python
 @dataclass(frozen=True)
@@ -172,8 +163,12 @@ class SelectedMemory:
     r: float
     cos: float
     bm25: float
-    sim: float            # cos（语义可用）否则 bm25 归一化值
-    header_tokens: int = 20
+    sim: float                    # cos（语义可用）否则 bm25 归一值
+    header_tokens: int = 20       # 实际装填成本由 fill 的 constraints.head_per_item 传入
+    bridge: bool = False          # Retriever 用 config.retrieval.header_tokens（默认 24）
+    source_pool: str = "dm"       # "dm" | "group" | "bridge"
+    tokens: int = 0
+    score_detail: dict | None = None
 
 @dataclass(frozen=True)
 class RetrievalResult:
@@ -182,62 +177,130 @@ class RetrievalResult:
     tokens: int
     budget: int
     degraded: bool
+    injected_items: list = []     # fill 产出：记忆字段 + r/score/affect/bridge/source_pool/tokens/header_tokens
+    bridge_hit: int = 0           # 最终注入的桥接条数（fill 之后）
+    bridge_candidates: int = 0    # 跨池去重后、进 fill 前的桥接候选数
+    bridge_truncated: bool = False
+    dedup_removed: int = 0        # 跨池去重删除的重复对数
+    dedup_degraded: bool = False
+    affect_bias: int = 0          # 本轮 rel=1 且 affect_match 实际改变排序（affect_sim > 0）的条数
 
 class Retriever:
-    def __init__(self, embedder: Embedder, cfg: Config, metrics: Metrics | None = None): ...
-    def search(self, items: Iterable[MemoryItem], query: str, *,
-               scope: str, user_id: str,
-               bot_state: BotState | None = None,
-               now: datetime | None = None) -> RetrievalResult: ...
+    def __init__(self, embedder, cfg, metrics=None): ...
+    def search(self, items, query, *, scope, user_id, user_affect=None,
+               last_event_affect=None, bot_state=None, now=None) -> RetrievalResult: ...
+```
+
+**装填接口（冻结）**：
+
+```python
+fill(entries, constraints, *, metrics=None) -> {"injected_items": [...], "truncated": bool, "total_tokens": int}
+
+# constraints 由 Retriever 显式传入；fill 本身不做 1200/300 的缺省兜底
+constraints = {
+    "total": cfg.retrieval.budget_tokens,
+    "head_per_item": cfg.retrieval.header_tokens,
+    "subgroup": {"bridge": min(300, cfg.bridge.budget_tokens)},
+}
 ```
 
 实现步骤（顺序固定）：
 
-1. **先过滤**：`scope=="group"` → 只留 `item.scope=="group"`；
-   `scope=="dm"` → 只留 `item.scope=="dm" and item.user_id==user_id`（§3.2）。
-2. **BM25**：中文按 CJK 字符 bigram（单字 run 用单字）+ 拉丁/数字按小写分词；
-   `k1/b` 取配置；对**本批候选**做 min-max 归一化到 [0,1]（max==min → 全部 0）。
-3. **语义分**：`embedder.available` 且有候选带 `item.vector`（长度 = `embedder.dim`）时，
-   `cos = dot(query_vec, item.vector)`（已归一化）；缺 vector 的条目 cos=0。
-   以下情况降级：`weights=(w_vector=0, w_bm25=1)`、`degraded=True`，并记一次
-   `retrieval.degraded`（字段 `reason`）：
-   - embedder 不可用；或 query 编码抛异常；或没有任何候选带可用向量。
-4. **R**：`lifecycle.retention_now(item, now=now, avoidance_now=bot_state.avoidance if bot_state else 0.0, cfg=cfg.decay)`。
-5. **score**：
+1. 候选池：群聊 = 全部 `scope=group`（混合池，不按 user_id 预过滤），`rel=1` 仅当前用户；
+   私聊 = `scope=dm and user_id==user_id`；`should_bridge` 命中时追加同 user 的 active group 记忆。
+2. BM25：CJK 字符 bigram + 拉丁词；`k1/b` 取配置；批内 min-max 归一化（max==min → 0）。
+3. 语义分：embedder 可用且有向量时 `cos = dot(query_vec, item.vector)`；否则降级 BM25 并记
+   `retrieval.degraded`。
+4. R：`retention_now(item, now=now, avoidance_now=bot_state.avoidance or 0, cfg=cfg.decay)`。
+5. 打分（顺序）：`(0.6cos+0.4bm25)` → ×R → ×type_bonus（rel=1 再 ×(1+0.1·familiarity)）→
+   dormant×0.3 → ×(1+β(2A−1)) → rel=1 ×(1+0.15·(affection−annoyance)) →
+   affect_match 开启且 last_event_affect 非空 ×(1+0.1·affect_sim) → bridge ×0.7。
+6. **跨池去重（打分之后、排序之前）**：`dedup_key` 精确优先，余弦 >0.9 二次判定；重复对保留
+   score 高者、同分保留 dm；删除对数记 `group_bridge.dedup`；向量不可用退化原文匹配并记
+   `dedup.degraded`。
+7. 排序确定性：`score` 降序 → `r` 降序 → `id` 升序。
+8. 装填（最后一步）：单条成本 `head_per_item + estimate_tokens(content)`；跳过装不下的继续；
+   总量 ≤ total；桥接子预算 ≤ subgroup.bridge；超限记 `group_bridge.truncated` /
+   `retrieval.truncated`。**顺序是「过滤/建池 → 打分 → 跨池去重 → 排序 → fill」，不是先去重再打分。**
+- 只读：不写盘、不改 items、不调 `update_memory`；`user_affect` 由调用方传入（`store.get`）。
+- 硬规则 18 的配置上限由 Retriever 强制：桥接 weight 实际生效 ≤0.7、桥接子预算实际生效 ≤300。
 
-   ```text
-   base = w_vec * cos + w_bm25 * bm25
-   score = base * R * type_bonus[item.type]
-   if item.status == "dormant": score *= cfg.retrieval.dormant_factor
-   if cfg.retrieval.mood_bias_enabled and bot_state is not None:
-        score *= lifecycle.mood_bias_factor(bot_state.valence, item.valence, cfg.retrieval.mood_bias_beta)
-   ```
+## 6. `prompt.py`
 
-   （全部系数取 `cfg`；`type_bonus` 缺省 1.0。）
-6. **排序**：`score` 降序；相同则 `r` 降序；再相同按 `id` 升序（确定性）。
-7. **预算装填**（§6.3）：按序装入，单条成本 = `header_tokens + estimate_tokens(content)`；
-   装不下就**跳过该条继续**（不截断正文）；累计 ≤ `budget_tokens`；`tokens` 为实际占用。
-8. 不得修改 `items`、不得写盘；`sim` 供 §5.3 强化判定（cos 可用则用 cos，否则 bm25 归一值）。
+```python
+EXTRACTION_PROTOCOL           # 含 affect 可选字段示例
+render_memory_block(injected_items, users) -> str
+build_prompt(*, persona, summary, retrieval=None, injected_items=None, users, recent_turns,
+             user_message, gate_passed, limits=None) -> PromptBundle
+```
 
-### 测试要求（`tests/test_retrieval.py`、可加 `tests/test_embedding.py`）
+- 行头：`[记忆 m_0001|用户A|episode|R=0.82|affect=anger:0.6|10-23]`；bridge 行头
+  `[群聊记忆 ...]`；affect 缺失/neutral 省略。
+- 记忆块前附系统提示：「群聊记忆是用户本人在群里说过的话……不是别人说的」。
+- 昵称 / content 过 `sanitize_for_prompt`；记忆块只进用户上下文区，不与系统指令混排。
+- 协议只在 `gate_passed` 时追加到系统提示末尾。
 
-- scope 隔离（group/dm 互不可见；dm 只检索同一 user）；
-- 打分公式与排序（至少验证 type_bonus、dormant×0.3、心境一致性同号/异号、R 衰减）；
-- 预算装填：含 header 开销、大条目跳过、不截断；
-- 降级：NullEmbedder → 纯 BM25 且记 `retrieval.degraded`；部分条目缺 vector；
-- BM25 归一化边界（max==min、空候选）；
-- 确定性（同输入同输出，与传入顺序无关）；
-- 无网络、无 sentence-transformers 依赖。
+## 7. `memory.py`
 
-## 5. 其它模块（Lead 维护）
+```python
+class MemorySystem:
+    affect_store: UserAffectStore
+    def update_memory(self, item_id, ops, *, reason="") -> bool: ...
+    def remember(self, ...) -> ...       # 去重 → compute_S("init") → 落盘
+    def reinforce(self, ...) -> ...      # 复活 / 强化，全部经 update_memory
+    def search(self, ...) -> RetrievalResult   # 检索前 affect_store.decay
+    def retry_pending(self) -> ...       # 只重放新记忆；turn_key 幂等
+    def maintain(self) -> MaintenanceReport
+```
 
-`store.py`（jsonl 读写容错 / 向量 sidecar / 原子重写）、`memory.py`（生命周期与写入）、
-`gate.py`（§4.1 闸门）、`summary.py`、`prompt.py`、`pipeline.py`（§7 每轮流程）、
-`obsidian.py`（只读库）、`service.py`、`cli.py`、`tools.py`。
+- `update_memory`：Set 白名单 `S / status / last_access`；Inc 白名单 `access_count / mention_count`；
+  Inc 内部读旧值；S 写 clamp [0,90]；非法字段/值 → `state.write_guard`、整体不生效、返回 False。
+- `remember`：dedup_key 精确优先、余弦二次；向量不可用记 `dedup.degraded`；affect 写入；
+  `compute_S("init", ..., valence=state.valence, affect=item.affect)`。
+- `reinforce`：dormant 复活 `compute_S("revive")`；active `compute_S("reinforce", S, R)`；经 update_memory。
+- `_refresh_statuses` / `maintain` 的 status 写也经 `update_memory`。
+- pending：只存新记忆（带 turn_key），重放前查已存在则跳过；强化/感情更新永不进 pending。
+- `search()` 前 `affect_store.decay(user_id)`，并把 `UserAffect` 传给 Retriever。
 
-## 6. 验证命令
+## 8. `pipeline.py`
+
+```python
+PreparedTurn / TurnContext:
+    # 冻结（构造后不可改）
+    persona, state, summary, candidates, retrieval, prompt, injected_items,
+    user_id, scope, gate_passed, turn_key, light_path, last_event_affect_at_read
+    # 可写白名单
+    last_event_affect, metrics, pending
+
+class TurnPipeline:
+    def prepare(self, event) -> PreparedTurn: ...
+    def finish(self, ctx, raw, sender=None) -> TurnResult: ...
+    def run_turn(self, event, llm_call) -> TurnResult: ...
+```
+
+- 越界写冻结字段 → 抛 `ContextViolation` 并记 `ctx.violation`。
+- `finish` 顺序：parse → `clean_answer_for_send` → emit → summary/recent → write_back。
+- `write_back` 顺序：8a familiarity → 8b persist → 9a 强化/复活（只改内存）→ 9b affect 聚合（单次 step_update）
+  → 10 last_event_affect；9b 只消费本轮 `injected_items` 中 `user_id==当前用户` 且非 neutral 的 affect。
+- `aggregate()` 唯一聚合函数；`first_non_neutral()` 只决定 `last_event_affect`。
+- 各段独立 try/except；失败只记 `turn.*_error`，回答照常返回。
+
+## 9. `service.py` / `cli.py` / `tools.py`
+
+- 服务：item payload 增加 `affect`；search payload 增加
+  `bridge={hit,candidates,truncated}`、`dedup={removed,degraded}`；新增 `GET /user_affect?user_id=`；
+  `/health` 版本随包版本（0.2.0）。
+- CLI：`list` 显示 affect；新增 `affect get --user <id>` / `affect decay --user <id>`；
+  `--version` 输出 `qihun-memory 0.2.0`（帮助描述含 v1.5-r2）。
+- `tools.py` 导出新增公共符号：`Set / Inc / compute_S / UserAffectStore / UserAffect / fill / should_bridge /
+  clean_answer_for_send / normalize_text / dedup_key / normalize_item / dedup_within_batch /
+  split_raw_candidate / parse_memories / validate_affect / aggregate / first_non_neutral /
+  ContextViolation / TurnContext / load_bot_state` 等（以 `tools.__all__` 为准）。
+
+## 10. 验证命令
 
 ```bash
-python -m pytest -q                    # 全量
+python -m pytest -q                    # 全量（最小 CI：L1~L4 + A/B）
 python -m pytest tests/test_parser.py -q
+python -m qihun_memory.cli --version
 ```

@@ -1,6 +1,9 @@
-# 器魂记忆系统 v1.4 · 现网桥接与旧库导入契约（Lead 定稿）
+# 器魂记忆系统 v1.5-r2 · 现网桥接与旧库导入契约
 
 本文件是 qihun-mem 与 qq-bridge 两侧并行开发的唯一契约。任何改动先改本文件再改代码。
+设计规范（当前权威）：[../QiHun-Memory-System-v1.5-r2.md](../QiHun-Memory-System-v1.5-r2.md)。
+本文件 §1~§10 为 v1.4 起沿用的接入主契约；§11 是 v1.5-r2 增量（user_affect / 桥接 / 指标），
+两者同时有效。
 
 ## 1. 目标
 
@@ -30,6 +33,8 @@ qihun 配置模板（config.json；data_dir 相对 config.json 所在目录解�
   "embedding": {"enabled": false, "backend": "none", "model": "", "dim": 0},
   "prompt": {"persona_tokens": 2000, "summary_tokens": 500},
   "gate": {"enforce_write": true},
+  "affect": {"step_alpha": 0.1, "stale_days": 30.0},
+  "bridge": {"enabled": true, "weight": 0.7, "budget_tokens": 300},
   "metrics": {"enabled": true, "debug_raw": false},
   "service": {"host": "127.0.0.1", "port": 18765, "token": "<随机 32 hex>"}
 }
@@ -51,7 +56,7 @@ bridge 侧配置（config.json 新增；由 setup 脚本写入）：
 }
 ```
 
-## 3. 服务端契约（Lead 负责改 `src/qihun_memory/service.py`）
+## 3. 服务端契约（`src/qihun_memory/service.py`）
 
 保留现有全部端点。`POST /turn/prepare` 响应**新增** `injection` 字段（桥接只用它，不再自己拼 system）：
 
@@ -75,7 +80,7 @@ bridge 侧配置（config.json 新增；由 setup 脚本写入）：
 - prepare 额外行为：payload 带 `nickname` 且 `user_id` 非空时，刷新 users.json 昵称（只在该用户昵称变化时写盘）。
 - `/turn/finish` 不变：`{turn_id, raw}` → `{ok, answer, written, ...}`；`answer` 是去掉哨兵后的正文。
 - 所有端点（含 /health）在配置了 token 时都要求 `Authorization: Bearer <token>`。
-- 写入闸门、turn_key 幂等、坏数据隔离等规则全部沿用 v1.4 规范，桥接不得绕过。
+- 写入闸门、turn_key 幂等、坏数据隔离等规则全部沿用 v1.5-r2 规范（本文件 §11 为增量契约），桥接不得绕过。
 
 ## 4. 桥接适配器契约（bridge-dev 负责 `src/qihun-memory.mjs`）
 
@@ -177,14 +182,15 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
 - 桥接：重启后 bridge.log 出现「器魂记忆已接入」；一轮真实消息后 memory.jsonl 新增/合并记录；
   QQ 侧看不到 `<MEMORY_JSON>`。
 
-## 9. 写权限（互不重叠）
+## 9. 变更约定（模块边界）
 
-- Lead：`src/qihun_memory/service.py`、`tests/test_service.py`、`docs/INTEGRATION.md`、`README.md`、`docs/DEPLOYMENT.md`、
-  运行时 config/data、最终验收与 git。
-- importer-dev：`src/qihun_memory/legacy_import.py`、`src/qihun_memory/summary.py`、`src/qihun_memory/cli.py`、`tests/test_legacy_import.py`。
-- bridge-dev：`src/qihun-memory.mjs`、`src/bridge.js`、`scripts/setup-qihun-memory.mjs`、`scripts/test-qihun-memory.mjs`、
+- 服务端：`src/qihun_memory/service.py`、`tests/test_service.py`、`docs/INTEGRATION.md`、`README.md`、`docs/DEPLOYMENT.md`
+  与运行时 config/data、最终验收与提交。
+- 导入器：`src/qihun_memory/legacy_import.py`、`src/qihun_memory/summary.py`、`src/qihun_memory/cli.py`、`tests/test_legacy_import.py`。
+- 桥接侧：`src/qihun-memory.mjs`、`src/bridge.js`、`scripts/setup-qihun-memory.mjs`、`scripts/test-qihun-memory.mjs`、
   `scripts/test-qihun-setup.mjs`、`config.example.json`、`package.json`、`一键桥接.bat`、`docs/QIHUN-MEMORY.md`。
-- 共享文件（memory.py、store.py、models.py、config.py）本阶段**不改**；确需改动先找 Lead。
+- 共享核心（memory.py / store.py / models.py / config.py）改动必须先更新设计规范与接口文档，再改代码；
+  不允许绕过附录 D1 的状态单点。
 
 ## 10. 现网落地记录（2026-10-26）
 
@@ -220,7 +226,7 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
   `persona_path=data/persona.md`（vault 不再是运行依赖）；`summary_tokens=500`（现网偏差）；
   `baseUrl` 留空时按 qihun host/port 推导；setup 先备份 qihun 配置、importer 180s 超时；私聊昵称不再污染
   `users.json`；注入顺序统一；日志打印原始 prompt。
-- 修复后验收：Python **292 passed**（3.11 上 291 passed + 1 skipped）；桥接 `npm run test:qihun` **66 pass**、`test:vault` 10 pass、
+- 修复后验收（v1.4 当时）：Python **292 passed**（3.11 上 291 passed + 1 skipped）；桥接 `npm run test:qihun` **66 pass**、`test:vault` 10 pass、
   audit 41/46（5 个为本机既有环境问题）；真实环境已重部署（新桥接进程 + 新服务进程，`/health`
   `total=15`，`users.json` 含「群记忆 / 管理员」，persona 从 `data/persona.md` 读取）。
 ### 10.2 Obsidian 只读视图（2026-10-26 追加）
@@ -241,3 +247,40 @@ python -m qihun_memory.cli import-legacy -c <config.json> [-d <data_dir>] \\
 - 已知限制：`vaultMemory` 与 `qihunMemory` 同时开启时，pumpMux 先执行旧 vault 的 `consumeTurn`
   （会先剥掉隐藏块），导致新版 finish 拿不到哨兵、从而不写记忆。setup 默认已关闭旧 vault；
   如手工双开，请把新版 finish 放在旧 vault 之前，或只保留一个记忆层。
+
+## 11. v1.5-r2 增量契约（叠加在 §1~§10 之上）
+
+### 11.1 服务端新增 / 变化
+
+- `GET /user_affect?user_id=<id>`（只读）：返回该用户的感情快照
+  `{affection, annoyance, familiarity, updated_at, stale}`；未记录时返回初值。**没有写接口**。
+- `GET /health` 版本号随包版本（0.2.0 / v1.5-r2）。
+- `/memory/list`、`/memory/search` 的 item payload 增加 `affect`；search 额外返回：
+  - `retrieval.bridge = {hit, candidates, truncated}`：`hit`=最终注入桥接条数，`candidates`=去重后进 fill 前候选数；
+  - `retrieval.dedup = {removed, degraded}`：`removed`=跨池去重删除的重复对数（去重发生在打分之后）。
+- `/turn/prepare` 的 `injection` 结构不变；新增的检索调制（混合池 / 桥接）全部在服务端完成，
+  桥接注入行头以 `[群聊记忆 ...]` 标注，宿主无需感知。
+- `/turn/finish` 返回值不变；写回顺序（8a→8b→9a→9b→10）由服务端保证。
+
+### 11.2 桥接侧（qq-bridge）必须遵守
+
+1. **不碰 user_affect.json**：用户感情只由记忆系统的 `UserAffectStore` 写；桥接不得读写
+   `data/user_affect.json`。
+2. **只写 state.json**：情感快照仍由桥接每轮 prepare 前写入（`{valence, avoidance=max(0,-valence),
+   updated_at}`，原子写、快照为空不写）；记忆系统只读。
+3. **群聊检索不桥接**：桥接只发生在私聊语境；桥接预算 300、权重 0.7、单向（dm 读 group），
+   宿主不得在群聊回合请求或拼装群聊→私聊方向的数据。
+4. **只发送 `finish.answer`**：任何情况下不把 raw / 哨兵 / JSON 发到 QQ（服务端 parser +
+   桥接本地兜底双层剥离；v1.5 的 `clean_answer_for_send` 是服务端唯一发送清洗点）。
+5. **msgid 幂等**：继续传 msgid 作为 `turn_key`；断线重放不重复写记忆、不重复感情步进。
+6. **静默 / 后台回合**：不注入、不写记忆、不参与感情聚合。
+7. **指标透传**：桥接日志建议透出 `group_bridge.*`、`user_affect.*`、`dedup.degraded` 摘要，
+   便于线上定位（服务端 `GET /metrics` 已是权威来源）。
+
+### 11.3 验收（v1.5-r2 追加）
+
+- Python：`python -m pytest -q` 全绿（L1~L4 + A/B）；`python -m qihun_memory.cli --version` → `qihun-memory 0.2.0`（对应规范 v1.5-r2）。
+- 服务：`GET /user_affect?user_id=` 200；`GET /health` version=0.2.0；prepare/search 含 affect 与 bridge 摘要。
+- 桥接：真实私聊一轮后 `/metrics` 出现 `turn.finish`；若触发桥接，`group_bridge.triggered.*`、
+  `group_bridge.hit` 可见；回复不含 `<MEMORY_JSON>` / 裸 JSON。
+- 兼容：老数据（无 affect / 无 user_affect.json）导入后正常检索与写入（用例 45）。

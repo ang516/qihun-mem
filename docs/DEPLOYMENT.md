@@ -1,13 +1,13 @@
 # 部署与接入（qq-bridge / DSH）
 
 本文说明如何把器魂记忆系统接入现网 QQ bot。设计规范见
-[../QiHun-Memory-System-v1.4.md](../QiHun-Memory-System-v1.4.md)，实现架构见
+[../QiHun-Memory-System-v1.5-r2.md](../QiHun-Memory-System-v1.5-r2.md)（v1.5-r2 冻结整合版），实现架构见
 [ARCHITECTURE.md](ARCHITECTURE.md)，本次现网接入与旧库导入的完整契约见
 [INTEGRATION.md](INTEGRATION.md)。
 
 ## 1. 前置条件
 
-- Python >= 3.11（现网 DSH 桌面版自带 3.14 可用），且已 `python -m pip install -e .`
+- Python >= 3.11（现网 DSH 桌面版自带 3.14 可用），且已 `python -m pip install -e .`（当前包版本 0.2.0 / 规范 v1.5-r2）
 - 一个可写的记忆数据目录（不要放在只读 Obsidian 库内）
 - 可选：`sentence-transformers` + 本地 `bge-small-zh-v1.5`（不装则自动降级纯 BM25）
 - qq-bridge：Node >= 20（现网 24），仓库在 `D:/大肥鱼的聊天记录/qq-bridge`
@@ -35,6 +35,8 @@ python -m qihun_memory.cli init --data-dir D:/qihun-mem-data
   `data/persona.md`，不依赖 vault），不会创建 / 修改 / 删除库内任何文件。
 - `state.json` 由情感系统写入 `data_dir/state.json`，记忆系统只读；6 小时未更新按中性处理。
   现网 qq-bridge 适配器会在每轮 prepare 前把情感引擎快照同步过去（见 §4.4）。
+- v1.5 新增两节配置可省略（走默认值）：`affect`（用户感情初值/步长/衰减）与
+  `bridge`（私聊→群聊桥接开关/权重/预算）；完整默认值见规范 §8。
 
 ### 2.1 旧 Obsidian 记忆库 → 新记忆系统（一次性导入）
 
@@ -216,6 +218,12 @@ return fin.answer;   // 只发这个；不要发 raw
   - `mem_extract.bad_json` > 2%/天 → 模型输出漂移；
   - `mem_extract.no_sentinel` > 5% → 提示词被截断；
   - `mem_write.fail` / `retrieval.degraded` / `state.stale` 非零 → 查磁盘 / 模型 / 情感系统。
+- v1.5 新增观测（同见 §12.1）：
+  - `dedup.degraded`、`group_bridge.hit / truncated / dedup / userid_mismatch`：桥接与跨池去重健康度；
+  - `user_affect.stale / fail`：用户感情文件健康度；
+  - `state.write_guard`、`ctx.violation`：任何非零都是实现缺陷（有模块绕开单点 / 越界写 ctx）；
+  - `retrieval.affect_bias`：`affect_match` 打开后本轮匹配条数。
+- 用户感情只读接口：`GET /user_affect?user_id=`（桥接/控制台可展示，禁止写回）。
 - 用户看到 `{"memories"` 片段：检查发送链路是否用了 `raw` 而不是 `answer`。
 - 记忆不增长：看 `mem_extract.bad_json` / `no_sentinel`；以及桥接日志里有没有
   `器魂记忆回写` / `prepare 失败`。
@@ -260,5 +268,21 @@ python -m qihun_memory.cli obsidian search 上海 -c config.json
   `*.json` 与 `summary.json` 可由进程重建但建议一起备份。
   现网位置：`qq-bridge/state/qihun-memory/data/`。
 - 直接复制整个 `data_dir` 到新机器、修改 `config.json` 即完成迁移。
+- v1.5 新增文件 `user_affect.json` / `affect.bad.jsonl` 随 `data_dir` 一起备份即可；老数据无需迁移。
 - `memory.archive.jsonl` 是死记忆档案（不参与检索），保留即可。
 - 旧 Obsidian 库 `D:/AI-Agent-Vault` 导入后保持原样，可直接归档备份。
+
+## 9. 升级到 v1.5-r2（从 v1.4）
+
+1. **拉代码 + 重装**：`python -m pip install -e .`（包版本 0.2.0）。
+2. **配置**：老 `config.json` 可直接沿用；按需补 `affect` / `bridge` 节（不写走默认）。
+   若现网把 `retrieval.header_tokens` 显式设成 20，建议删除或改为 24（affect 行头开销）。
+3. **数据**：无需迁移；老 `memory.jsonl` 无 `affect` 照常加载；`user_affect.json` 不存在时从初值开始。
+4. **重启服务**：`GET /health` 的 version 应为 0.2.0；跑一次 `POST /maintain`（补向量 / 重写 / 清理）。
+5. **验证**：
+   - `python -m qihun_memory.cli --version` 输出 `qihun-memory 0.2.0`（对应规范 v1.5-r2）；
+   - `GET /user_affect?user_id=<活跃用户>` 返回初值/已聚合值；
+   - 私聊发「刚才群里说的那个」：有同用户群聊记忆时应出现 `group_bridge.triggered.*` 与
+     `group_bridge.hit`；
+   - `GET /metrics` 无 `state.write_guard` / `ctx.violation` / `user_affect.fail`。
+6. **回滚**：v1.4 读取会忽略 `affect` / 新配置节，数据不会丢；回滚后 `user_affect.json` 保留但对 v1.4 无影响。
