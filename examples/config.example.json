@@ -20,6 +20,7 @@
     "reinforce_sim": 0.5,
     "dedupe_sim": 0.9,
     "kv": 0.5,
+    "ka": 0.3,
     "lam": 0.2,
     "suppression_valence": -0.3,
     "suppression_avoidance": 0.5,
@@ -27,7 +28,7 @@
   },
   "retrieval": {
     "budget_tokens": 1200,
-    "header_tokens": 20,
+    "header_tokens": 24,
     "w_vector": 0.6,
     "w_bm25": 0.4,
     "type_bonus": {
@@ -40,7 +41,25 @@
     "mood_bias_beta": 0.2,
     "bm25_k1": 1.5,
     "bm25_b": 0.75,
-    "light_path_enabled": true
+    "light_path_enabled": true,
+    "gamma_u": 0.15,
+    "familiarity_eta": 0.1,
+    "affect_match": false,
+    "gamma_a": 0.1
+  },
+  "affect": {
+    "initial_affection": 0.5,
+    "initial_annoyance": 0.0,
+    "initial_familiarity": 0.3,
+    "step_alpha": 0.1,
+    "stale_days": 30.0,
+    "annoyance_decay_base": 0.9,
+    "annoyance_decay_period_days": 7.0
+  },
+  "bridge": {
+    "enabled": true,
+    "weight": 0.7,
+    "budget_tokens": 300
   },
   "extraction": {
     "max_items": 5,

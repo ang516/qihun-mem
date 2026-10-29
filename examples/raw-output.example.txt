@@ -1,4 +1,4 @@
 好的，记下了。下周三去上海，路上注意安全。
 <MEMORY_JSON>
-{"memories":[{"type":"episode","content":"用户A下周三去上海出差","tags":["出差","上海"]}]}
+{"memories":[{"type":"episode","content":"用户A下周三去上海出差","tags":["出差","上海"],"affect":{"label":"joy","intensity":0.4}}]}
 </MEMORY_JSON>

@@ -1,0 +1,14 @@
+{
+  "123456789": {
+    "affection": 0.62,
+    "annoyance": 0.04,
+    "familiarity": 0.45,
+    "updated_at": "2026-10-29T12:00:00+00:00"
+  },
+  "987654321": {
+    "affection": 0.5,
+    "annoyance": 0.0,
+    "familiarity": 0.3,
+    "updated_at": "2026-10-29T11:58:00+00:00"
+  }
+}
