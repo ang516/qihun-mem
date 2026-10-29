@@ -1,11 +1,19 @@
-"""记忆生命周期与系统门面（v1.4 §4 / §5 / §6 / §7 步骤 8-9）。
+"""记忆生命周期与系统门面（v1.5-r2 §4 / §5 / §7.2 / §7.3 / 附录 D1）。
 
 职责：
-- 写入：去重 → S₀ → 先追加 JSONL 再更新内存；失败进 pending，下一轮重试一次（§4.2.5）；
+- 写入：dedup_key 精确去重 → 余弦去重 → affect/valence 调制 S₀ → 追加 JSONL；
+  失败进 pending，下一轮重试一次（§4.2.5）；
 - 遗忘：惰性计算 R、dormant 翻转、强匹配复活、档案移动（§5 / §8）；
-- 强化：被选中注入的条目 S·(1+R)，cap 90（§5.3）；
-- 检索：委托 retrieval.Retriever（先过滤 scope + user_id，再打分）；
+- 强化：被选中注入的条目经 compute_S("reinforce")，cap 90（§5.3）；
+- 状态单点：所有条目状态写盘（S/status/last_access/access_count/mention_count）
+  只经 update_memory(Set/Inc)，禁止第二份写入路径（附录 D1）；
+- 检索：委托 retrieval.Retriever；检索前对 UserAffectStore 做惰性 decay 并传入；
 - 维护：每日重写、R<0.02 移档、清理调试日志（§2.4 / §8 / §12.2）。
+
+v1.5-r2 新增：
+- 每条记忆 affect（parser 归一化 → 落库；S₀ 用 compute_S("init", ...) 调制）；
+- UserAffectStore 接线（本模块只通过实例方法读写 user_affect.json）；
+- pending 只重放“新记忆写入”（带 turn_key 幂等）；强化/感情更新永不进 pending。
 """
 
 from __future__ import annotations
@@ -16,24 +24,36 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .config import Config
 from .embedding import Embedder, get_embedder
 from .fsutil import atomic_write_text
-from .lifecycle import (
-    initial_stability,
-    reinforce_stability,
-    retention_now,
-    revive_stability,
-)
+from .lifecycle import compute_S, retention_now
 from .metrics import Metrics
-from .models import ALLOWED_SCOPES, ALLOWED_TYPES, MemoryItem, parse_iso, utc_now, utc_now_iso
+from .models import (
+    ALLOWED_SCOPES,
+    ALLOWED_STATUS,
+    MAX_STABILITY,
+    Inc,
+    MemoryItem,
+    Set,
+    affect_label,
+    parse_iso,
+    sanitize_affect,
+    utc_now,
+    utc_now_iso,
+)
+from .parser import dedup_key, normalize_item
 from .retrieval import RetrievalResult, Retriever
-from .state import BotState, UserDirectory, load_bot_state
+from .state import BotState, UserAffect, UserAffectStore, UserDirectory, load_bot_state
 from .store import MemoryStore
 
 log = logging.getLogger("memory")
+
+# 附录 D1：update_memory 的字段白名单（任何不在表内的字段 = 越界写）
+_SET_FIELDS = frozenset({"S", "status", "last_access"})
+_INC_FIELDS = frozenset({"access_count", "mention_count"})
 
 
 def _dot(left: list[float], right: list[float]) -> float:
@@ -71,6 +91,8 @@ class MaintenanceReport:
 
 @dataclass
 class _PendingWrite:
+    """待重放的新记忆写入（只允许新记忆；强化/感情更新不进此队列）。"""
+
     item: MemoryItem
 
 
@@ -107,6 +129,8 @@ class MemorySystem:
             read_only=self.read_only,
         )
         self.store.load()
+        # user_affect 的唯一读写入口（附录 D1）；禁止其他模块直接读写 user_affect.json
+        self.affect_store = UserAffectStore(cfg.user_affect_file, cfg.affect, self.metrics)
         self.users = UserDirectory(cfg.users_file)
         self.retriever = Retriever(self.embedder, cfg, self.metrics)
         self._pending: list[_PendingWrite] = []
@@ -118,6 +142,10 @@ class MemorySystem:
     @property
     def items(self) -> dict[str, MemoryItem]:
         return self.store.items
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
 
     def all_items(self) -> list[MemoryItem]:
         return list(self.store.items.values())
@@ -132,6 +160,18 @@ class MemorySystem:
             now=now,
             metrics=self.metrics,
         )
+
+    def user_affect(
+        self,
+        user_id: str,
+        *,
+        now: datetime | None = None,
+        decay: bool = False,
+    ) -> UserAffect:
+        """用户感情快照（只读；decay=True 时先做惰性衰减）。"""
+        if decay:
+            return self.affect_store.decay(user_id, now=now)
+        return self.affect_store.get(user_id, now)
 
     def persona(self) -> str:
         """persona.md 只读（可能来自 data_dir 或只读 Obsidian 库）。"""
@@ -164,9 +204,99 @@ class MemorySystem:
                 "available": bool(self.embedder.available),
             },
             "users": len(self.users.snapshot()),
+            "user_affect_users": len(self.affect_store.snapshot()),
             "pending_writes": len(self._pending),
             "metrics": self.metrics.counters(),
         }
+
+    # ------------------------------------------------------------------
+    # 状态单点：update_memory(Set/Inc)（附录 D1）
+    # ------------------------------------------------------------------
+
+    def update_memory(self, item_id: str, ops: Any, *, reason: str = "") -> bool:
+        """唯一的状态写入入口：白名单 Set/Inc，整体生效或整体不生效。
+
+        返回 True = 全部操作已生效；False = 任一操作非法（整批不生效）或条目不存在。
+        非法字段/值记 state.write_guard；S 写 clamp [0, 90]。
+        """
+        item = self.store.items.get(str(item_id))
+        if item is None:
+            self._write_guard(item_id, field=None, error="unknown_item", reason=reason)
+            return False
+        if isinstance(ops, (Set, Inc)):
+            ops = [ops]
+        try:
+            operations = list(ops)
+        except TypeError:
+            self._write_guard(item_id, field=None, error="invalid_ops", reason=reason)
+            return False
+        if not operations:
+            return True
+        pending: dict[str, Any] = {}
+        for op in operations:
+            if isinstance(op, Set):
+                if op.field not in _SET_FIELDS:
+                    self._write_guard(item_id, op.field, "field_not_allowed", reason)
+                    return False
+                try:
+                    pending[op.field] = self._validated_set(op.field, op.value)
+                except (TypeError, ValueError):
+                    self._write_guard(item_id, op.field, "invalid_value", reason)
+                    return False
+            elif isinstance(op, Inc):
+                if op.field not in _INC_FIELDS:
+                    self._write_guard(item_id, op.field, "field_not_allowed", reason)
+                    return False
+                if isinstance(op.delta, bool) or not isinstance(op.delta, int):
+                    self._write_guard(item_id, op.field, "invalid_delta", reason)
+                    return False
+                # Inc 内部读旧值（同批次先前操作的结果也算旧值）
+                base = pending.get(op.field, getattr(item, op.field, 0))
+                pending[op.field] = max(0, int(base) + int(op.delta))
+            else:
+                self._write_guard(item_id, field=None, error="invalid_operation", reason=reason)
+                return False
+        # 校验通过后才整体应用：任一项非法都不会留下半写状态
+        for field_name, value in pending.items():
+            setattr(item, field_name, value)
+        return True
+
+    @staticmethod
+    def _validated_set(field_name: str, value: Any) -> Any:
+        if field_name == "S":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError("S must be a number")
+            number = float(value)
+            if number != number or number in (float("inf"), float("-inf")):
+                raise ValueError("S must be finite")
+            return max(0.0, min(number, MAX_STABILITY))
+        if field_name == "status":
+            if value not in ALLOWED_STATUS:
+                raise ValueError(f"invalid status: {value!r}")
+            return value
+        if field_name == "last_access":
+            if not isinstance(value, str):
+                raise TypeError("last_access must be an ISO string")
+            return parse_iso(value).isoformat(timespec="seconds")
+        raise ValueError(f"field not allowed: {field_name!r}")
+
+    def _write_guard(
+        self,
+        item_id: Any,
+        field: str | None,
+        error: str,
+        reason: str = "",
+    ) -> None:
+        try:
+            self.metrics.event(
+                "state.write_guard",
+                item_id=str(item_id),
+                field=field,
+                error=error,
+                reason=reason or None,
+            )
+        except Exception:  # pragma: no cover - 指标绝不反噬主流程
+            pass
 
     # ------------------------------------------------------------------
     # 向量（§6.5）
@@ -191,7 +321,7 @@ class MemorySystem:
 
     def ensure_vectors(self, limit: int = 64) -> int:
         """补算缺失向量（补算前该条不参与语义分，§6.5）。"""
-        if not self.embedder.available:
+        if self.embedder.available is False:
             return 0
         missing = [item for item in self.store.items.values() if not item.vector][:limit]
         if not missing:
@@ -237,6 +367,7 @@ class MemorySystem:
 
         判定使用**未压抑**的 R：dormant 是持久状态，压抑只允许临时影响可提取性
         （§5.2「不是忘掉，是不易想起」）；否则几轮回避就会把记忆永久降级（A4）。
+        状态写走 update_memory（附录 D1）。
         """
         changed = 0
         for item in self._scope_items(scope, user_id):
@@ -244,8 +375,8 @@ class MemorySystem:
                 continue
             r = retention_now(item, now=now, avoidance_now=0.0, cfg=self.cfg.decay)
             if r < self.cfg.decay.dormant_r:
-                item.status = "dormant"
-                changed += 1
+                if self.update_memory(item.id, Set("status", "dormant"), reason="refresh_statuses"):
+                    changed += 1
         if changed:
             self.metrics.event("memory.dormant", count=changed)
         return changed
@@ -257,23 +388,36 @@ class MemorySystem:
         user_id: str,
         *,
         now: datetime | None = None,
+        last_event_affect: Mapping[str, Any] | None = None,
     ) -> RetrievalResult:
-        """纯检索：不强化（强化只在「被选中并注入」之后由 reinforce 执行）。"""
+        """纯检索：不强化（强化只在「被选中并注入」之后由 reinforce 执行）。
+
+        检索前对当前用户的 UserAffectStore 做惰性 decay（§5.4），并把快照 /
+        上一轮事件 affect 传给 Retriever（§7.2 rel/familiarity/affect_match）。
+        """
         current = now or utc_now()
+        user = str(user_id)
         bot_state = self.state(current)
+        # 检索前 decay：annoyance *= 0.9^floor(days/7)，stale 归零（只写 user_affect.json）
+        user_affect = self.affect_store.decay(user, now=current)
         # 不在检索路径里补算向量：embedding 属于写入/后台补算（§6.5），不能阻塞宿主取 prompt
-        self._refresh_statuses(scope, user_id, bot_state, current)
+        self._refresh_statuses(scope, user, bot_state, current)
         return self.retriever.search(
             self.store.items.values(),
             query,
             scope=scope,
-            user_id=user_id,
+            user_id=user,
             bot_state=bot_state,
             now=current,
+            user_affect=user_affect,
+            last_event_affect=last_event_affect,
         )
 
     def reinforce(self, result: RetrievalResult, *, now: datetime | None = None) -> int:
-        """§5.3 / §5.1：被注入的记忆强化；dormant 强匹配复活（S 重置为 S₀）。"""
+        """§5.3 / §5.1：被注入的记忆强化；dormant 强匹配复活（S 重置为 S₀）。
+
+        所有状态写只经 update_memory（Set/Inc）；强化/感情更新永不进 pending。
+        """
         current = now or utc_now()
         now_iso = current.isoformat(timespec="seconds")
         changed = 0
@@ -282,18 +426,41 @@ class MemorySystem:
             if item.status == "dormant":
                 # 只有强匹配才复活；0.5~0.7 区间不强化、不刷新 last_access，
                 # 避免出现「永远 dormant 但一直在注入」的僵尸状态（B4）
-                if entry.sim > self.cfg.decay.revive_sim:
-                    item.S = revive_stability(item.type, self.cfg.decay)
-                    item.status = "active"
-                    item.last_access = now_iso
-                    item.access_count += 1
+                if entry.sim <= self.cfg.decay.revive_sim:
+                    continue
+                ok = self.update_memory(
+                    item.id,
+                    [
+                        Set("S", compute_S("revive", item.type, cfg=self.cfg.decay)),
+                        Set("status", "active"),
+                        Set("last_access", now_iso),
+                        Inc("access_count"),
+                    ],
+                    reason="reinforce.revive",
+                )
+                if ok:
                     self.metrics.event("memory.revived", reason="strong_match", item_id=item.id)
                     changed += 1
                 continue
-            if entry.sim > self.cfg.decay.reinforce_sim:
-                item.S = reinforce_stability(item.S, entry.r, self.cfg.decay)
-                item.last_access = now_iso
-                item.access_count += 1
+            if entry.sim <= self.cfg.decay.reinforce_sim:
+                continue
+            new_s = compute_S(
+                "reinforce",
+                item.type,
+                S=item.S,
+                R=entry.r,
+                cfg=self.cfg.decay,
+            )
+            ok = self.update_memory(
+                item.id,
+                [
+                    Set("S", new_s),
+                    Set("last_access", now_iso),
+                    Inc("access_count"),
+                ],
+                reason="reinforce",
+            )
+            if ok:
                 self.metrics.event("memory.reinforced", item_id=item.id, S=round(item.S, 6))
                 changed += 1
         return changed
@@ -302,70 +469,81 @@ class MemorySystem:
     # 写入（§4.2.8 / §4.3 / §4.2.5）
     # ------------------------------------------------------------------
 
-    def _validate_extracted(self, raw: Any) -> tuple[str, str, list[str]] | None:
-        if not isinstance(raw, dict):
-            return None
-        item_type = str(raw.get("type") or "")
-        content = raw.get("content")
-        if item_type not in ALLOWED_TYPES or not isinstance(content, str):
-            return None
-        cleaned_chars: list[str] = []
-        for ch in content:
-            code = ord(ch)
-            if code < 32 or code == 127 or 0x80 <= code <= 0x9F or 0xD800 <= code <= 0xDFFF:
-                continue
-            cleaned_chars.append(ch)
-        cleaned = "".join(cleaned_chars).strip()
-        cleaned = cleaned[: self.cfg.extraction.max_content]
-        if not cleaned:
-            return None
-        # 纵深防御：解析器已拒绝，直接 API 调用也不能把哨兵/围栏写进记忆
-        if "<MEMORY_JSON>" in cleaned or "</MEMORY_JSON>" in cleaned or chr(96) * 3 in cleaned:
-            return None
-        tags_raw = raw.get("tags")
-        tags: list[str] = []
-        if isinstance(tags_raw, list):
-            for tag in tags_raw:
-                text = str(tag).strip()
-                if text:
-                    tags.append(text[: self.cfg.extraction.max_tag_len])
-                if len(tags) >= self.cfg.extraction.max_tags:
-                    break
-        return item_type, cleaned, tags
-
-    def _find_duplicate(
-        self,
-        user_id: str,
-        scope: str,
-        item_type: str,
-        content: str,
-        new_vector: list[float] | None,
-    ) -> MemoryItem | None:
-        """§4.2.8：同 user_id + scope + type 内，cos > 0.9 视为同一条。"""
-        candidates = [
+    def _dedup_candidates(self, user_id: str, scope: str, item_type: str) -> list[MemoryItem]:
+        return [
             item
             for item in self.store.items.values()
             if item.user_id == user_id and item.scope == scope and item.type == item_type
         ]
-        if not candidates:
-            return None
-        if self.embedder.available and new_vector is not None:
-            best: MemoryItem | None = None
-            best_sim = -1.0
-            for candidate in candidates:
-                if not candidate.vector or len(candidate.vector) != len(new_vector):
-                    continue
-                sim = _dot(new_vector, candidate.vector)
-                if sim > best_sim:
-                    best, best_sim = candidate, sim
-            if best is not None:
-                return best if best_sim > self.cfg.decay.dedupe_sim else None
-            self.metrics.event("memory.dedupe_degraded", reason="no_vectors")
-        target = content.strip()
+
+    @staticmethod
+    def _exact_duplicate(
+        candidates: Iterable[MemoryItem],
+        item_type: str,
+        content: str,
+    ) -> MemoryItem | None:
+        """第一优先级：dedup_key 精确命中（type.lower + normalize_text(content)）。"""
+        wanted = dedup_key({"type": item_type, "content": content})
         for candidate in candidates:
-            if candidate.content.strip() == target:
+            if dedup_key(candidate.to_dict()) == wanted:
                 return candidate
         return None
+
+    def _similar_duplicate(
+        self,
+        candidates: list[MemoryItem],
+        new_vector: list[float] | None,
+    ) -> tuple[MemoryItem | None, str | None]:
+        """第二优先级：同 user+scope+type 内 cos > 0.9。
+
+        返回 (命中条目|None, 降级原因|None)。降级 = 本可用余弦但向量不可用；
+        调用方记 dedup.degraded（与跨池 group_bridge.dedup 分开）。
+        """
+        if not candidates:
+            return None, None
+        if not self.embedder.available:
+            return None, "embedder_unavailable"
+        if new_vector is None:
+            return None, "encode_failed"
+        best: MemoryItem | None = None
+        best_sim = -1.0
+        usable = 0
+        for candidate in candidates:
+            if not candidate.vector or len(candidate.vector) != len(new_vector):
+                continue
+            usable += 1
+            sim = _dot(new_vector, candidate.vector)
+            if sim > best_sim:
+                best, best_sim = candidate, sim
+        if best is None:
+            return None, "no_vectors" if usable == 0 else None
+        if best_sim > self.cfg.decay.dedupe_sim:
+            return best, None
+        return None, None
+
+    def _merge_duplicate(
+        self,
+        duplicate: MemoryItem,
+        now_iso: str,
+        *,
+        match: str,
+        item_type: str,
+    ) -> bool:
+        """重复提及：last_access 刷新 + mention_count 自增；dormant 复活（不改 access_count）。"""
+        ops: list[Any] = [Set("last_access", now_iso), Inc("mention_count")]
+        revived = False
+        if duplicate.status == "dormant":
+            ops.append(Set("S", compute_S("revive", duplicate.type, cfg=self.cfg.decay)))
+            ops.append(Set("status", "active"))
+            revived = True
+        ok = self.update_memory(duplicate.id, ops, reason="dedup.merge")
+        if not ok:  # 白名单字段不会失败；防御性记录，避免静默丢合并
+            self.metrics.event("memory.dedup_guard_fail", item_id=duplicate.id)
+            return False
+        if revived:
+            self.metrics.event("memory.revived", reason="dedupe", item_id=duplicate.id)
+        self.metrics.event("memory.deduped", item_id=duplicate.id, type=item_type, match=match)
+        return True
 
     def remember(
         self,
@@ -377,12 +555,16 @@ class MemorySystem:
         turn_key: str = "",
         now: datetime | None = None,
     ) -> WriteReport:
-        """写入提取结果。任何写盘失败都不抛异常（§4.2.5）。"""
+        """写入提取结果（输入按 parser 归一化后的条目；兼容直接 API 调用时再归一化）。
+
+        任何写盘失败都不抛异常（§4.2.5）；失败的新记忆进 pending，下一轮重试一次。
+        """
         current = now or utc_now()
         now_iso = current.isoformat(timespec="seconds")
         report = WriteReport()
         items_in = list(extracted)
-        if not str(user_id).strip() or scope not in ALLOWED_SCOPES:
+        user = str(user_id)
+        if not user.strip() or scope not in ALLOWED_SCOPES:
             report.skipped = len(items_in)
             self.metrics.event("mem_write.invalid", reason="missing_user_or_scope")
             return report
@@ -397,30 +579,48 @@ class MemorySystem:
 
         self.retry_pending(now=current)
         self.ensure_vectors()
+        degraded_noted = False
+        try:
+            valence_value = float(valence)
+        except (TypeError, ValueError):
+            valence_value = 0.0
+        if valence_value != valence_value or valence_value in (float("inf"), float("-inf")):
+            valence_value = 0.0
+        valence_value = max(-1.0, min(1.0, valence_value))
 
         for raw in items_in:
-            parsed = self._validate_extracted(raw)
-            if parsed is None:
+            normalized = normalize_item(raw, self.cfg.extraction, self.metrics)
+            if normalized is None:
                 report.skipped += 1
                 self.metrics.event("mem_write.skipped", reason="invalid_item")
                 continue
-            item_type, content, tags = parsed
-            new_vector = self._encode(content)
-            duplicate = self._find_duplicate(user_id, scope, item_type, content, new_vector)
+            item_type = str(normalized["type"])
+            content = str(normalized["content"])
+            tags = list(normalized.get("tags") or [])
+            affect = sanitize_affect(normalized.get("affect")) if normalized.get("affect") else None
+            candidates = self._dedup_candidates(user, scope, item_type)
+
+            # 1) dedup_key 精确优先（不需要向量）
+            duplicate = self._exact_duplicate(candidates, item_type, content)
+            match = "dedup_key"
+            if duplicate is None:
+                # 2) 再余弦 > 0.9；向量不可用只降级并记 dedup.degraded
+                new_vector = self._encode(content)
+                duplicate, degraded_reason = self._similar_duplicate(candidates, new_vector)
+                match = "cosine"
+                if degraded_reason and not degraded_noted:
+                    degraded_noted = True
+                    self.metrics.event("dedup.degraded", reason=degraded_reason, scope=scope)
             if duplicate is not None:
-                duplicate.last_access = now_iso
-                duplicate.mention_count += 1
-                if duplicate.status == "dormant":
-                    duplicate.S = revive_stability(duplicate.type, self.cfg.decay)
-                    duplicate.status = "active"
-                    self.metrics.event("memory.revived", reason="dedupe", item_id=duplicate.id)
-                report.merged.append(duplicate)
-                self.metrics.event("memory.deduped", item_id=duplicate.id, type=item_type)
+                if self._merge_duplicate(duplicate, now_iso, match=match, item_type=item_type):
+                    report.merged.append(duplicate)
+                else:
+                    report.skipped += 1
                 continue
 
             item = MemoryItem(
                 id=self.store.next_id(),
-                user_id=str(user_id),
+                user_id=user,
                 scope=scope,
                 type=item_type,
                 content=content,
@@ -428,11 +628,19 @@ class MemorySystem:
                 last_access=now_iso,
                 access_count=0,
                 mention_count=1,
-                S=initial_stability(item_type, valence, self.cfg.decay),
-                valence=float(valence),
+                # 唯一 S 计算入口：影响因子 k_v / k_a 只在 lifecycle.compute_S 出现
+                S=compute_S(
+                    "init",
+                    item_type,
+                    valence=valence_value,
+                    affect=affect,
+                    cfg=self.cfg.decay,
+                ),
+                valence=valence_value,
                 status="active",
                 tags=tags,
                 turn_key=turn_key or None,
+                affect=affect,
                 vector=new_vector,
             )
             try:
@@ -440,6 +648,7 @@ class MemorySystem:
             except Exception as exc:  # 含 UnicodeEncodeError 等：落盘失败绝不能影响回答（§11 规则 13）
                 report.failed += 1
                 self.metrics.event("mem_write.fail", exc_type=type(exc).__name__)
+                # pending 只存“新记忆写入”，并把 turn_key 一并带上（幂等重放）
                 self._pending.append(_PendingWrite(item=item))
                 continue
             if new_vector:
@@ -451,6 +660,7 @@ class MemorySystem:
                 type=item_type,
                 scope=scope,
                 S=round(item.S, 3),
+                affect=affect_label(affect),
             )
 
         # turn_key 在「整轮全部命中合并」时也要登记，否则重放会重复累加 mention_count（B3）
@@ -460,24 +670,36 @@ class MemorySystem:
         return report
 
     def retry_pending(self, *, now: datetime | None = None) -> dict[str, int]:
-        """§4.2.5：失败条目下一轮重试 1 次；仍失败则丢弃并记 mem_write.fail。"""
+        """§4.2.5：失败条目下一轮重试 1 次；仍失败则丢弃并记 mem_write.fail。
+
+        v1.5：pending 只重放新记忆写入；重放前查 turn_key（已落盘则跳过）与 id
+        （同一条已在内存中则跳过），避免重复追加。
+        """
         if not self._pending:
-            return {"retried": 0, "written": 0, "dropped": 0}
+            return {"retried": 0, "written": 0, "dropped": 0, "skipped": 0}
         pending = self._pending
         self._pending = []
         written = 0
         dropped = 0
+        skipped = 0
         for entry in pending:
+            item = entry.item
+            if item.id in self.store.items:
+                skipped += 1
+                continue
+            if item.turn_key and self.store.has_turn_key(item.turn_key):
+                skipped += 1
+                continue
             try:
-                self.store.append(entry.item)
+                self.store.append(item)
             except Exception as exc:
                 dropped += 1
                 self.metrics.event("mem_write.fail", exc_type=type(exc).__name__, reason="retry_dropped")
                 continue
-            if entry.item.vector:
-                self.store.append_vector(entry.item)
+            if item.vector:
+                self.store.append_vector(item)
             written += 1
-        return {"retried": len(pending), "written": written, "dropped": dropped}
+        return {"retried": len(pending), "written": written, "dropped": dropped, "skipped": skipped}
 
     # ------------------------------------------------------------------
     # 维护（§2.4 / §8 / §12.2）
@@ -495,8 +717,8 @@ class MemorySystem:
             if r < self.cfg.decay.archive_r:
                 dead_ids.append(item.id)
             elif r < self.cfg.decay.dormant_r and item.status == "active":
-                item.status = "dormant"
-                report.dormant += 1
+                if self.update_memory(item.id, Set("status", "dormant"), reason="maintain.dormant"):
+                    report.dormant += 1
         try:
             if dead_ids:
                 report.archived = self.store.archive(dead_ids)
