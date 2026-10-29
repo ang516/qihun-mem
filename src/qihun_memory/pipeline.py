@@ -1,11 +1,13 @@
-"""每轮流程（v1.4 §7）。
+"""每轮流程（v1.5-r2 §7）。
 
 实现为两阶段，便于与「LLM 调用不由本系统发起」的宿主（qq-bridge / DSH）集成：
 
-- prepare：读 state（只读）→ 闸门（§4.1）→ 检索（§6.1 路由，与闸门解耦）
-  → 组 prompt（§6.4 / §4.2.1）；
-- finish：解析 raw（parser，永不抛异常）→ **先发送 answer**（§7 顺序 7）
-  → 更新滚动摘要 / 最近轮次 → 写记忆（try/except）→ 强化 → 指标。
+- prepare（build_context）：读 state（只读）→ 闸门（§4.1）→ 检索（§6 路由，
+  含桥接 / 打分 / fill 装填 → injected_items）→ 组 prompt（§6.5）；
+  随后冻结 ctx（§7.2）：只有 last_event_affect / metrics / pending 可写。
+- finish：parse → clean_answer_for_send → emit（先发送）→ summary/recent
+  → write_back（8a 熟悉度 → 8b 逐条落盘 → 9a 强化 → 9b 感情聚合 → 10 事件 affect）；
+  顺序由 §7.3 / 附录 D6 锁定。
 
 run_turn(event, llm_call) 是两者组合的便捷入口。
 """
@@ -18,18 +20,37 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable
+from typing import Any, Callable, Iterable, Mapping
 
 from .config import Config
 from .gate import is_light_message, should_extract
 from .memory import MemorySystem, WriteReport
 from .metrics import Metrics
-from .models import utc_now
-from .parser import ExtractResult, MemoryOutputParser
+from .models import (
+    ANGER_AFFECT_LABELS,
+    JOY_AFFECT_LABELS,
+    affect_intensity,
+    affect_label,
+    sanitize_affect,
+    utc_now,
+)
+from .parser import ExtractResult, MemoryOutputParser, clean_answer_for_send
 from .prompt import PromptBundle, build_prompt
 from .retrieval import RetrievalResult
 from .state import BotState, load_bot_state
 from .summary import RollingSummary, conversation_key
+
+# §7.2：ctx 只写白名单（其余字段一律冻结）
+_CTX_MUTABLE_FIELDS = frozenset({"last_event_affect", "metrics", "pending"})
+
+
+class ContextViolation(RuntimeError):
+    """试图修改 PreparedTurn/TurnContext 的冻结字段（§7.2 / 附录 E R1）。"""
+
+    def __init__(self, field_name: str, *, turn_id: str = "") -> None:
+        super().__init__(f"ctx field is frozen: {field_name}")
+        self.field = field_name
+        self.turn_id = turn_id
 
 
 @dataclass(frozen=True)
@@ -46,7 +67,7 @@ class TurnEvent:
     now: datetime | None = None
 
     def make_turn_key(self) -> str:
-        """§2.4 幂等键 = user_id + 消息 msgid；没有 msgid 时不做去重。"""
+        """§2.6 幂等键 = user_id + 消息 msgid；没有 msgid 时不做去重。"""
         if not self.msgid:
             return ""
         return f"{self.user_id}:{self.msgid}"
@@ -54,20 +75,77 @@ class TurnEvent:
 
 @dataclass
 class PreparedTurn:
+    """一轮的只读上下文（TurnContext）。构造后仅三个字段可写（§7.2）。
+
+    frozen dataclass + mutable_fields 白名单：越界写抛 ContextViolation 并记
+    ctx.violation；由架构测试 / L3 断言守护（附录 E R1）。
+    """
+
+    # ---------- 冻结字段（构造后不可改） ----------
     turn_id: str
     event: TurnEvent
+    user_id: str
+    scope: str
     gate_passed: bool
     light_path: bool
+    persona: str
+    state: BotState
+    summary: str
+    candidates: int
     retrieval: RetrievalResult
     prompt: PromptBundle
-    bot_state: BotState
-    summary_text: str
+    injected_items: list
+    turn_key: str
     now: datetime
-    turn_key: str = ""
+    last_event_affect_at_read: dict | None
+    # ---------- 可写白名单（仅以下三个） ----------
+    last_event_affect: dict | None = None
+    metrics: dict = field(default_factory=dict)
+    pending: list = field(default_factory=list)
+    # ---------- 内部（不参与语义） ----------
+    _metrics_sink: Metrics | None = field(default=None, repr=False, compare=False)
+    _sealed: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_sealed" or not self.__dict__.get("_sealed", False):
+            object.__setattr__(self, name, value)
+            return
+        if name in _CTX_MUTABLE_FIELDS:
+            object.__setattr__(self, name, value)
+            return
+        sink = self.__dict__.get("_metrics_sink")
+        turn_id = str(self.__dict__.get("turn_id", ""))
+        if sink is not None:
+            try:
+                sink.event("ctx.violation", turn_id=turn_id, field=name)
+            except Exception:  # pragma: no cover - 指标绝不反噬主流程
+                pass
+        raise ContextViolation(name, turn_id=turn_id)
+
+    # ---------- 兼容旧字段名（只读属性） ----------
+
+    @property
+    def bot_state(self) -> BotState:
+        return self.state
+
+    @property
+    def summary_text(self) -> str:
+        return self.summary
 
     @property
     def retrieval_ids(self) -> list[str]:
         return [entry.item.id for entry in self.retrieval.selected]
+
+    @property
+    def injected_ids(self) -> list[str]:
+        return [str(item.get("id")) for item in self.injected_items if isinstance(item, Mapping)]
+
+
+# 兼容旧名：TurnContext 是 PreparedTurn 的语义别名
+TurnContext = PreparedTurn
 
 
 @dataclass
@@ -95,20 +173,95 @@ class TurnResult:
         }
 
 
+# --------------------------------------------------------------------------
+# 指标 / 聚合工具（纯函数，便于单测）
+# --------------------------------------------------------------------------
+
 def user_id_hash(user_id: str) -> str:
     # errors="replace"：user_id 带孤立代理字符时也不能让 prepare/finish 抛异常
     return hashlib.sha256(str(user_id).encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def retrieval_summary(result: RetrievalResult) -> dict:
-    return {
+    """检索摘要（service / cli / turn.finish 共用；新增桥接与去重字段）。"""
+    payload = {
         "candidates": result.candidates,
         "selected": [entry.item.id for entry in result.selected],
         "tokens": result.tokens,
         "budget": result.budget,
         "degraded": result.degraded,
     }
+    injected = getattr(result, "injected_items", None)
+    if injected is not None:
+        payload["injected"] = len(injected)
+    for name in (
+        "bridge_hit",
+        "bridge_candidates",
+        "bridge_truncated",
+        "dedup_removed",
+        "dedup_degraded",
+        "affect_bias",
+    ):
+        value = getattr(result, name, None)
+        if value is not None:
+            payload[name] = value
+    return payload
 
+
+def aggregate(
+    injected_items: Iterable[Mapping[str, Any]] | None,
+    *,
+    user_id: str,
+    alpha: float = 0.1,
+) -> dict[str, float]:
+    """9b 唯一聚合函数（§5.5 / 附录 D6 I3）。
+
+    只消费本轮 injected_items 中 user_id 等于当前用户、且 affect 非 neutral 的条目：
+    I_joy = max(joy/affection 的 intensity)，I_anger = max(anger/disgust 的 intensity)，
+    deltas = {affection: alpha * I_joy, annoyance: alpha * I_anger}（0 分量不传）。
+    """
+    user = str(user_id)
+    joy = 0.0
+    anger = 0.0
+    for item in injected_items or []:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("user_id") or "") != user:
+            continue
+        affect = item.get("affect")
+        if not isinstance(affect, Mapping):
+            continue
+        label = affect_label(affect)
+        if label == "neutral":
+            continue
+        intensity = affect_intensity(affect)
+        if label in JOY_AFFECT_LABELS:
+            joy = max(joy, intensity)
+        elif label in ANGER_AFFECT_LABELS:
+            anger = max(anger, intensity)
+    step = max(0.0, float(alpha))
+    deltas: dict[str, float] = {}
+    if joy > 0:
+        deltas["affection"] = step * joy
+    if anger > 0:
+        deltas["annoyance"] = step * anger
+    return deltas
+
+
+def first_non_neutral(memories: Iterable[Mapping[str, Any]] | None) -> dict | None:
+    """10：本轮新记忆里第一个非 neutral affect（只供下一轮 affect_match）。"""
+    for item in memories or []:
+        if not isinstance(item, Mapping):
+            continue
+        affect = sanitize_affect(item.get("affect"))
+        if affect is not None and affect_label(affect) != "neutral":
+            return affect
+    return None
+
+
+# --------------------------------------------------------------------------
+# TurnPipeline
+# --------------------------------------------------------------------------
 
 class TurnPipeline:
     """§7 的每轮流程；线程内单写者使用。"""
@@ -123,9 +276,11 @@ class TurnPipeline:
         self.summaries = RollingSummary(self.cfg.summary_file, self.cfg.prompt)
         self._recent: dict[str, deque[tuple[str, str]]] = {}
         self._prepared: dict[str, PreparedTurn] = {}
+        # 进程内「上一轮事件 affect」：只供下一轮 affect_match（重启后为空，用例 44）
+        self._last_event_affect: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
-    # 阶段一：准备
+    # 阶段一：准备（build_context）
     # ------------------------------------------------------------------
 
     def _recent_for(self, key: str) -> deque[tuple[str, str]]:
@@ -133,10 +288,60 @@ class TurnPipeline:
             self._recent[key] = deque(maxlen=max(1, self.cfg.prompt.recent_turns))
         return self._recent[key]
 
+    @staticmethod
+    def _empty_retrieval(cfg: Config, budget: int | None = None) -> RetrievalResult:
+        """轻路径 / 降级路径的空检索结果（只带兼容必需字段）。"""
+        return RetrievalResult(
+            selected=[],
+            candidates=0,
+            tokens=0,
+            budget=int(cfg.retrieval.budget_tokens) if budget is None else budget,
+            degraded=False,
+        )
+
     def prepare(self, event: TurnEvent) -> PreparedTurn:
         started = time.perf_counter()
         now = event.now or utc_now()
         turn_key = event.make_turn_key()
+        key = conversation_key(event.scope, event.user_id)
+        last_read = self._last_event_affect.get(key)
+        try:
+            return self._prepare(
+                event,
+                now=now,
+                key=key,
+                turn_key=turn_key,
+                last_read=last_read,
+                started=started,
+            )
+        except Exception as exc:  # §7.1：prepare 异常 → 无记忆注入的降级 prompt
+            self.metrics.event("turn.prepare_error", exc_type=type(exc).__name__)
+            return self._degraded_prepare(
+                event,
+                now=now,
+                key=key,
+                turn_key=turn_key,
+                last_read=last_read,
+                started=started,
+            )
+
+    def _prepare(
+        self,
+        event: TurnEvent,
+        *,
+        now: datetime,
+        key: str,
+        turn_key: str,
+        last_read: dict | None,
+        started: float,
+    ) -> PreparedTurn:
+        # 0. 上一轮写失败的新记忆：下一轮开始前最多重试 1 次（§4.4 / §7.4）
+        try:
+            self.system.retry_pending(now=now)
+        except Exception as exc:  # 重放失败只降记忆增益，绝不影响本轮
+            self.metrics.event(
+                "turn.prepare_error", stage="retry_pending", exc_type=type(exc).__name__
+            )
 
         # 1. state.json 只读（缺失/过期 → 中性，不抛异常）
         bot_state = load_bot_state(
@@ -155,22 +360,30 @@ class TurnPipeline:
         )
         light_path = bool(self.cfg.retrieval.light_path_enabled) and is_light_message(event.message)
         if light_path:
-            retrieval = RetrievalResult(
-                selected=[],
-                candidates=0,
-                tokens=0,
-                budget=self.cfg.retrieval.budget_tokens,
-                degraded=False,
-            )
+            retrieval = self._empty_retrieval(self.cfg)
         else:
-            retrieval = self.system.search(event.message, event.scope, event.user_id, now=now)
+            try:
+                retrieval = self.system.search(
+                    event.message,
+                    event.scope,
+                    event.user_id,
+                    now=now,
+                    last_event_affect=last_read,
+                )
+            except Exception as exc:  # 检索失败降级为空注入，回答照常
+                self.metrics.event(
+                    "turn.prepare_error",
+                    stage="search",
+                    exc_type=type(exc).__name__,
+                )
+                retrieval = self._empty_retrieval(self.cfg)
 
-        # 3. 组 prompt：persona + 摘要 + 检索结果 + 最近 5 轮 + 当前消息
-        key = conversation_key(event.scope, event.user_id)
-        summary_text = self.summaries.get(key)
+        # 3. 组 prompt：persona + 摘要 + injected_items + 最近 5 轮 + 当前消息
+        summary = self.summaries.get(key)
+        persona_text = self.system.persona()
         prompt = build_prompt(
-            persona=self.system.persona(),
-            summary=summary_text,
+            persona=persona_text,
+            summary=summary,
             retrieval=retrieval,
             users=self.system.users,
             recent_turns=list(self._recent_for(key)),
@@ -178,21 +391,109 @@ class TurnPipeline:
             gate_passed=gate_passed,
             limits=self.cfg.prompt,
         )
-
-        turn_id = uuid.uuid4().hex
-        prepared = PreparedTurn(
-            turn_id=turn_id,
-            event=event,
+        injected_items = list(getattr(retrieval, "injected_items", []) or [])
+        affect_bias = int(getattr(retrieval, "affect_bias", 0) or 0)
+        if affect_bias:
+            self.metrics.event("retrieval.affect_bias", count=affect_bias, scope=event.scope)
+        return self._build_ctx(
+            event,
+            turn_key=turn_key,
+            last_read=last_read,
+            started=started,
+            bot_state=bot_state,
             gate_passed=gate_passed,
             light_path=light_path,
             retrieval=retrieval,
             prompt=prompt,
-            bot_state=bot_state,
-            summary_text=summary_text,
-            now=now,
-            turn_key=turn_key,
+            summary=summary,
+            injected_items=injected_items,
+            persona=persona_text,
         )
-        self._prepared[turn_id] = prepared
+
+    def _degraded_prepare(
+        self,
+        event: TurnEvent,
+        *,
+        now: datetime,
+        key: str,
+        turn_key: str,
+        last_read: dict | None,
+        started: float,
+    ) -> PreparedTurn:
+        bot_state = load_bot_state(
+            self.cfg.bot_state_file,
+            cfg=self.cfg.state,
+            now=now,
+            metrics=self.metrics,
+        )
+        retrieval = self._empty_retrieval(self.cfg)
+        summary = ""
+        try:
+            summary = self.summaries.get(key)
+        except Exception:
+            summary = ""
+        prompt = build_prompt(
+            persona="",
+            summary=summary,
+            retrieval=retrieval,
+            users=self.system.users,
+            recent_turns=[],
+            user_message=event.message,
+            gate_passed=False,
+            limits=self.cfg.prompt,
+        )
+        return self._build_ctx(
+            event,
+            turn_key=turn_key,
+            last_read=last_read,
+            started=started,
+            bot_state=bot_state,
+            gate_passed=False,
+            light_path=True,
+            retrieval=retrieval,
+            prompt=prompt,
+            summary=summary,
+            injected_items=[],
+            persona="",
+        )
+
+    def _build_ctx(
+        self,
+        event: TurnEvent,
+        *,
+        turn_key: str,
+        last_read: dict | None,
+        started: float,
+        bot_state: BotState,
+        gate_passed: bool,
+        light_path: bool,
+        retrieval: RetrievalResult,
+        prompt: PromptBundle,
+        summary: str,
+        injected_items: list,
+        persona: str,
+    ) -> PreparedTurn:
+        turn_id = uuid.uuid4().hex
+        ctx = PreparedTurn(
+            turn_id=turn_id,
+            event=event,
+            user_id=str(event.user_id),
+            scope=str(event.scope),
+            gate_passed=gate_passed,
+            light_path=light_path,
+            persona=persona,
+            state=bot_state,
+            summary=summary,
+            candidates=int(getattr(retrieval, "candidates", 0) or 0),
+            retrieval=retrieval,
+            prompt=prompt,
+            injected_items=injected_items,
+            turn_key=turn_key,
+            now=event.now or utc_now(),
+            last_event_affect_at_read=last_read,
+            _metrics_sink=self.metrics,
+        )
+        self._prepared[turn_id] = ctx
         while len(self._prepared) > self.MAX_PREPARED:
             self._prepared.pop(next(iter(self._prepared)))
         self.metrics.event(
@@ -202,13 +503,15 @@ class TurnPipeline:
             scope=event.scope,
             gate=gate_passed,
             light_path=light_path,
-            candidates=retrieval.candidates,
+            candidates=ctx.candidates,
             selected=len(retrieval.selected),
-            tokens=retrieval.tokens,
-            degraded=retrieval.degraded,
+            injected=len(injected_items),
+            tokens=int(getattr(retrieval, "tokens", 0) or 0),
+            bridge_hit=int(getattr(retrieval, "bridge_hit", 0) or 0),
+            degraded=bool(getattr(retrieval, "degraded", False)),
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
         )
-        return prepared
+        return ctx
 
     # ------------------------------------------------------------------
     # 阶段二：完成
@@ -224,26 +527,25 @@ class TurnPipeline:
         if prepared.turn_id not in self._prepared:
             raise ValueError(f"turn already finished or unknown: {prepared.turn_id}")
         started = time.perf_counter()
-        now = utc_now()
         raw_text = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
 
-        # 6. 解析（永不抛异常；正文 = 哨兵前内容）
+        # 6. 解析（永不抛异常）→ 7. 发送层唯一清洗点
         parsed: ExtractResult = self.parser.parse(raw_text)
         self._record_extract_metrics(parsed, prepared)
+        raw_answer = parsed.raw_answer if isinstance(parsed.raw_answer, str) else ""
+        answer = clean_answer_for_send(raw_answer)
 
-        answer = parsed.answer
-
-        # 7. 先发送回答（空正文不发空气泡）
+        # 8. emit：先发送回答（空正文不发空气泡），早于任何写回（§7.3 顺序 1）
         if sender is not None and answer.strip():
             try:
                 sender(answer)
             except Exception as exc:  # 宿主发送回调失败也不能中断后续流程
                 self.metrics.event("turn.sender_fail", exc_type=type(exc).__name__)
 
-        key = conversation_key(prepared.event.scope, prepared.event.user_id)
+        key = conversation_key(prepared.scope, prepared.user_id)
 
         # §11 规则 5：未命中闸门的轮次不写记忆（防模型漂移/注入污染）；
-        # 闸门只约束写入，不影响检索与回答（§7）。
+        # 闸门只约束写入，不影响检索与回答（§7.1）。
         memories_to_write = parsed.memories
         ungated = 0
         if memories_to_write and not prepared.gate_passed and self.cfg.gate.enforce_write:
@@ -251,10 +553,12 @@ class TurnPipeline:
             memories_to_write = []
             self.metrics.event("mem_extract.ungated", count=ungated)
 
-        # turn_key 重放：不重复摘要、不重复写记忆（幂等，§2.4）
-        duplicate_turn = bool(prepared.turn_key) and self.system.store.has_turn_key(prepared.turn_key)
+        # turn_key 重放：不重复摘要、不重复写记忆（幂等，§2.6）
+        duplicate_turn = bool(prepared.turn_key) and self.system.store.has_turn_key(
+            prepared.turn_key
+        )
 
-        # 8. 摘要 / 最近轮次（独立 try；任何异常都不能影响回答）
+        # 9. 摘要 / 最近轮次（独立 try；任何异常都不能影响回答）
         if not duplicate_turn:
             try:
                 self.summaries.update(key, prepared.event.message, answer)
@@ -263,41 +567,24 @@ class TurnPipeline:
             except Exception as exc:
                 self.metrics.event("turn.finish_error", stage="summary", exc_type=type(exc).__name__)
 
-        # 9. 写记忆（独立 try/except；turn_key 幂等；valence = 本轮 LLM 调用后的情绪快照）
+        # 10. write_back：8a → 8b → 9a → 9b → 10（唯一写回路径，§7.5）
         write_report = WriteReport(skipped=len(memories_to_write), turn_duplicate=duplicate_turn)
-        if duplicate_turn:
-            self.metrics.event(
-                "mem_write.turn_dup",
-                turn_key_hash=hashlib.sha256(
-                    prepared.turn_key.encode("utf-8", "replace")
-                ).hexdigest()[:16],
-            )
-        elif memories_to_write:
-            try:
-                valence = float(self.system.state(now).valence)  # §7 步骤 5b
-            except Exception:
-                valence = prepared.bot_state.valence
-            try:
-                write_report = self.system.remember(
-                    memories_to_write,
-                    user_id=prepared.event.user_id,
-                    scope=prepared.event.scope,
-                    valence=valence,
-                    turn_key=prepared.turn_key,
-                    now=now,
-                )
-            except Exception as exc:  # 写记忆失败 = 本轮无新记忆，回答照常（§11 规则 13）
-                self.metrics.event("turn.finish_error", stage="remember", exc_type=type(exc).__name__)
-                write_report = WriteReport(failed=len(memories_to_write))
-
-        # 10. 被选中的记忆强化（只改内存；异常忽略）
-        reinforced = 0
         try:
-            reinforced = self.system.reinforce(prepared.retrieval, now=now)
-        except Exception as exc:  # 强化失败不能影响回答
-            self.metrics.event("memory.reinforce_fail", exc_type=type(exc).__name__)
+            write_report = self.write_back(prepared, memories_to_write)
+        except ContextViolation:  # ctx 越界写是实现缺陷，必须冒泡给测试/CI（§7.2）
+            raise
+        except Exception as exc:  # 写回失败 = 本轮无新记忆，回答照常（§11 规则 13）
+            self.metrics.event("turn.finish_error", stage="write_back", exc_type=type(exc).__name__)
+            write_report = WriteReport(
+                failed=len(memories_to_write),
+                turn_duplicate=duplicate_turn,
+            )
+            if memories_to_write:
+                prepared.pending.extend(memories_to_write)
 
-        # 11. 向量补算 / 调试原文：都在回答之后，失败全部吞掉
+        reinforced = int(prepared.metrics.get("reinforced", 0) or 0)
+
+        # 向量补算 / 调试原文：都在回答之后，失败全部吞掉
         try:
             self.system.ensure_vectors()
         except Exception:
@@ -324,13 +611,21 @@ class TurnPipeline:
             "turn_duplicate": write_report.turn_duplicate or duplicate_turn,
             "reinforced": reinforced,
             "retrieval_degraded": prepared.retrieval.degraded,
+            "injected": len(prepared.injected_items),
+            "bridge_hit": int(getattr(prepared.retrieval, "bridge_hit", 0) or 0),
+            "dedup_removed": int(getattr(prepared.retrieval, "dedup_removed", 0) or 0),
+            "dedup_degraded": bool(getattr(prepared.retrieval, "dedup_degraded", False)),
+            "affect_bias": int(getattr(prepared.retrieval, "affect_bias", 0) or 0),
+            "familiarity_step": prepared.metrics.get("familiarity_step"),
+            "affect_deltas": prepared.metrics.get("affect_deltas"),
+            "last_event_affect": affect_label(prepared.last_event_affect),
             "duration_ms": round(duration_ms, 3),
         }
         self.metrics.event(
             "turn.finish",
             turn_id=prepared.turn_id,
-            user_id_hash=user_id_hash(prepared.event.user_id),
-            scope=prepared.event.scope,
+            user_id_hash=user_id_hash(prepared.user_id),
+            scope=prepared.scope,
             raw_len=len(raw_text),
             raw_hash=parsed.raw_hash or hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16],
             **metrics_payload,
@@ -345,6 +640,139 @@ class TurnPipeline:
             duration_ms=duration_ms,
             metrics=metrics_payload,
         )
+
+    def write_back(self, ctx: PreparedTurn, memories: Iterable[dict] | None) -> WriteReport:
+        """§7.5 / 附录 D6：8a → 8b → 9a → 9b → 10（唯一写回路径）。
+
+        每步独立 try/except；失败只降记忆增益，不抛回聊天主流程。
+        """
+        now = utc_now()
+        alpha = float(self.cfg.affect.step_alpha)
+        items = list(memories or [])
+        duplicate = bool(ctx.turn_key) and self.system.store.has_turn_key(ctx.turn_key)
+        report = WriteReport(skipped=len(items), turn_duplicate=duplicate)
+
+        # 8a：熟悉度先记「这轮聊过」，先于落盘（§7.3 顺序 2）
+        if not duplicate:
+            try:
+                self.system.affect_store.step_update(
+                    ctx.user_id, {"familiarity": alpha}, now=now
+                )
+                ctx.metrics["familiarity_step"] = alpha
+            except ContextViolation:
+                raise
+            except Exception as exc:
+                self.metrics.event(
+                    "turn.finish_error", stage="write_back.8a", exc_type=type(exc).__name__
+                )
+
+        # 8b：逐条 persist 新记忆（失败 → pending + mem_write.fail）
+        if duplicate:
+            self.metrics.event(
+                "mem_write.turn_dup",
+                turn_key_hash=hashlib.sha256(
+                    ctx.turn_key.encode("utf-8", "replace")
+                ).hexdigest()[:16],
+            )
+        else:
+            report = self._persist_items(ctx, items, now=now)
+
+        # 9a：被选中注入的记忆强化 / 复活（只改内存；永不进 pending）
+        if not duplicate:
+            try:
+                reinforced = self.system.reinforce(ctx.retrieval, now=now)
+                ctx.metrics["reinforced"] = reinforced
+            except ContextViolation:
+                raise
+            except Exception as exc:
+                self.metrics.event(
+                    "turn.finish_error", stage="write_back.9a", exc_type=type(exc).__name__
+                )
+                ctx.metrics.setdefault("reinforced", 0)
+
+        # 9b：只聚合本轮 injected_items（fill 之后），单次 step_update
+        if not duplicate:
+            try:
+                deltas = aggregate(ctx.injected_items, user_id=ctx.user_id, alpha=alpha)
+                if deltas:
+                    self.system.affect_store.step_update(ctx.user_id, deltas, now=now)
+                ctx.metrics["affect_deltas"] = deltas
+            except ContextViolation:
+                raise
+            except Exception as exc:
+                self.metrics.event(
+                    "turn.finish_error", stage="write_back.9b", exc_type=type(exc).__name__
+                )
+
+        # 10：last_event_affect 只供下一轮 affect_match（不参与 user_affect）
+        try:
+            ctx.last_event_affect = first_non_neutral(items)
+        except ContextViolation:
+            raise
+        except Exception as exc:  # pragma: no cover - 纯函数防御
+            self.metrics.event(
+                "turn.finish_error", stage="write_back.10", exc_type=type(exc).__name__
+            )
+            ctx.last_event_affect = None
+        key = conversation_key(ctx.scope, ctx.user_id)
+        if ctx.last_event_affect is None:
+            self._last_event_affect.pop(key, None)
+        else:
+            self._last_event_affect[key] = dict(ctx.last_event_affect)
+        return report
+
+    def _persist_items(
+        self,
+        ctx: PreparedTurn,
+        items: list[dict],
+        *,
+        now: datetime,
+    ) -> WriteReport:
+        """8b：逐条落盘；单条失败不影响其余条目，失败条目进 ctx.pending。"""
+        report = WriteReport()
+        valence = float(ctx.state.valence)
+        for index, item in enumerate(items):
+            # turn_key 只挂在第一条，避免第二条起被 remember 的幂等判定整轮跳过
+            turn_key = ctx.turn_key if index == 0 else ""
+            try:
+                one = self.system.remember(
+                    [item],
+                    user_id=ctx.user_id,
+                    scope=ctx.scope,
+                    valence=valence,
+                    turn_key=turn_key,
+                    now=now,
+                )
+            except ContextViolation:
+                raise
+            except Exception as exc:
+                report.failed += 1
+                ctx.pending.append(item)
+                self.metrics.event("mem_write.fail", exc_type=type(exc).__name__)
+                self.metrics.event(
+                    "turn.finish_error", stage="write_back.8b", exc_type=type(exc).__name__
+                )
+                continue
+            report.created.extend(one.created)
+            report.merged.extend(one.merged)
+            report.skipped += one.skipped
+            report.failed += one.failed
+            report.pending = one.pending
+            report.turn_duplicate = report.turn_duplicate or one.turn_duplicate
+            if one.failed:
+                ctx.pending.append(item)
+        # 首条无效（被跳过）时兜底登记 turn_key，保证重放幂等；有失败条目不登记，
+        # 否则 pending 里带同一 turn_key 的失败条目会被误判为"已落盘"而丢失。
+        if (
+            report.failed == 0
+            and ctx.turn_key
+            and (report.created or report.merged)
+            and not self.system.store.has_turn_key(ctx.turn_key)
+        ):
+            anchor = (report.created or report.merged)[0]
+            self.system.store.register_turn_key(ctx.turn_key, anchor.id)
+        report.pending = self.system.pending_count
+        return report
 
     def _record_extract_metrics(self, parsed: ExtractResult, prepared: PreparedTurn) -> None:
         """§12.1 事件：ok / empty / no_sentinel 由 pipeline 记；bad_json / fail 由 parser 记。"""
