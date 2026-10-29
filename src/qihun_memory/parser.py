@@ -1,15 +1,17 @@
-"""LLM 输出解析（v1.4 §4.2）。
+"""LLM 输出解析（v1.5-r2 §4.2 / §4.2.3 / 附录 D2）。
 
-接口契约见 docs/INTERFACES.md 第 3 节。解析流水线顺序固定、不可互换：
-
+流水线顺序固定、不可互换：
 1. 哨兵切分：收集所有哨兵起始位置，从后往前逐个尝试；
 2. 括号平衡扫描：无哨兵时只从 memories 起点模式配对（字符串感知，未闭合切到文末）；
 3. 有限清洗：BOM / 零宽字符、首尾围栏、字符串外尾逗号（仅当 json.loads 失败时）；
 4. json.loads；
-5. 顶层结构校验 + 逐条校验（坏条单条丢弃，不丢整批）；
-6. 批内去重，最多 5 条。
+5. 顶层结构校验 + 逐条归一化（normalize_item：坏条单条丢弃，affect 非法只丢字段）；
+6. dedup_within_batch（dedup_key 精确去重）+ 最多 5 条。
 
-设计目标：parse() 永不抛异常；回答正文永不包含隐藏 JSON（含截断残片）。
+v1.5-r2 边界（附录 D2）：
+- 解析层只返回 raw_answer（不清洗 answer），永不抛异常；
+- 发送层 clean_answer_for_send 是唯一清洗点（硬规则 13 在此单点可测）；
+- 解析层禁止调 _drop_fences，发送层禁止调 _loads_candidate。
 """
 
 from __future__ import annotations
@@ -18,16 +20,18 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from .config import ExtractionConfig
 from .metrics import Metrics
+from .models import ALLOWED_AFFECT_LABELS, sanitize_affect
 
 log = logging.getLogger("memory")
 
 # --------------------------------------------------------------------------
-# 协议常量（v1.4 §4.2.1 / §8）
+# 协议常量（v1.5 §4.2.1 / §9）
 # --------------------------------------------------------------------------
 
 SENT_OPEN = "<MEMORY_JSON>"
@@ -50,26 +54,54 @@ TICK_RE = re.compile(FENCE + r"[A-Za-z0-9_+.-]*")
 LEAD_FENCE_RE = re.compile(r"^\s*" + FENCE + r"[A-Za-z0-9_+.-]*\s*")
 TAIL_FENCE_RE = re.compile(r"\s*" + FENCE + r"\s*$")
 
-# §4.2.6 注入脱敏：全角化后不会再被识别成哨兵 / 围栏
+# §4.2 注入脱敏：全角化后不会再被识别成哨兵 / 围栏
 _SAFE_OPEN = "\uff1cMEMORY_JSON\uff1e"
 _SAFE_CLOSE = "\uff1c/MEMORY_JSON\uff1e"
 _SAFE_FENCE = "\uff40" * 3
 
-# §12.1 指标事件名（parser 只负责 bad_json / fail / truncated 三个，
-# ok / empty / no_sentinel 由调用方 pipeline 记录）
+# §12.1 指标事件名（ok / empty / no_sentinel 由调用方 pipeline 记录）
 METRIC_BAD_JSON = "mem_extract.bad_json"
 METRIC_FAIL = "mem_extract.fail"
 METRIC_TRUNCATED = "mem_extract.truncated"
+METRIC_AFFECT_INVALID = "mem_extract.affect_invalid"
+METRIC_ITEM_INVALID = "mem_extract.item_invalid"
+
+# 中文标点 → 半角（只用于 dedup_key；不改原文）
+_PUNCT_MAP = str.maketrans(
+    {
+        "，": ",",
+        "。": ".",
+        "！": "!",
+        "？": "?",
+        "：": ":",
+        "；": ";",
+        "、": ",",
+        "（": "(",
+        "）": ")",
+        "【": "[",
+        "】": "]",
+        "《": "<",
+        "》": ">",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "…": "...",
+        "—": "-",
+        "～": "~",
+    }
+)
 
 
 @dataclass(frozen=True)
 class ExtractResult:
-    """一次解析的完整结果（冻结契约，字段语义见 docs/INTERFACES.md 第 3 节）。"""
+    """一次解析的完整结果（v1.5 增加 raw_answer，保留旧字段）。"""
 
     answer: str
     memories: list[dict]
     status: str
     sentinel_found: bool
+    raw_answer: str = ""
     truncated: bool = False
     exc_type: str | None = None
     raw_len: int = 0
@@ -78,7 +110,7 @@ class ExtractResult:
 
 
 # --------------------------------------------------------------------------
-# 文本清洗
+# 文本清洗（发送层 / 候选清洗）
 # --------------------------------------------------------------------------
 
 def _clean_invisible(text: str) -> str:
@@ -87,7 +119,10 @@ def _clean_invisible(text: str) -> str:
 
 
 def _drop_fences(text: str) -> str:
-    """正文清洗：不可见字符 + 控制字符 + 首尾围栏 + 残留围栏标记，再压平多余空行。"""
+    """正文清洗：不可见字符 + 控制字符 + 首尾围栏 + 残留围栏标记，再压平多余空行。
+
+    只允许发送层（clean_answer_for_send / _clean_answer）调用；解析层禁止调用。
+    """
     text = _clean_invisible(text)
     text = "".join(
         ch
@@ -110,10 +145,7 @@ def _clean_candidate(text: str) -> str:
 
 
 def _drop_trailing_commas(text: str) -> str:
-    """只在字符串外删除紧跟右括号的尾逗号（字符串内的逗号原样保留）。
-
-    这是「有限清洗」的边界：例如 content 里的「a,}b」必须原样保留。
-    """
+    """只在字符串外删除紧跟右括号的尾逗号（字符串内的逗号原样保留）。"""
     out: list[str] = []
     in_str = False
     escaped = False
@@ -200,7 +232,6 @@ def _candidate_spans(raw: str) -> list[tuple[int, int]]:
         start = match.start()
         end = _balanced_end(raw, start)
         if end is None:
-            # 未闭合的起点一路切到文末：截断残片不切掉就会漏到聊天里（§4.2.2 第 2 步）
             spans.append((start, len(raw)))
             break
         spans.append((start, end))
@@ -254,8 +285,69 @@ def _candidate_unclosed(candidate: str) -> bool:
 
 
 # --------------------------------------------------------------------------
-# 逐条校验
+# v1.5 归一化 / 去重（附录 D1：dedup_key 是唯一键定义）
 # --------------------------------------------------------------------------
+
+def normalize_text(text: str) -> str:
+    """去重键的规范化（v1.5 §4.2.2）：
+
+    1. Unicode NFKC；
+    2. 全角 ASCII → 半角（NFKC 已完成）；
+    3. 中文标点统一为半角（仅键用，不改原文）；
+    4. 删除零宽字符 / BOM / 控制字符；
+    5. 折叠连续空白为单空格，去首尾；
+    6. ASCII 大小写折叠；
+    7. emoji 保留原样，不折叠；
+    8. 不折叠重复字符（"好好好" ≠ "好"）；
+    9. 不截断（键用完整 normalize 文本，不截 500）。
+    """
+    if not isinstance(text, str):
+        try:
+            text = "" if text is None else str(text)
+        except Exception:
+            return ""
+    if not text:
+        return ""
+    try:
+        text = unicodedata.normalize("NFKC", text)
+        text = text.translate(_PUNCT_MAP)
+        text = "".join(
+            ch
+            for ch in text
+            if ch not in INVISIBLE
+            and not (0xD800 <= ord(ch) <= 0xDFFF)
+            and unicodedata.category(ch) != "Cc"
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+        text = "".join(ch.lower() if ord(ch) < 128 else ch for ch in text)
+        return text
+    except Exception:  # pragma: no cover - 纯防御
+        return text.strip()
+
+
+def dedup_key(item: Mapping[str, Any]) -> tuple[str, str]:
+    """唯一去重键定义：批内 / 跨轮 / 跨池共用，禁止各层自行拼键。"""
+    if not isinstance(item, Mapping):
+        return ("", "")
+    item_type = str(item.get("type") or "").strip().lower()
+    content = item.get("content")
+    if not isinstance(content, str):
+        content = "" if content is None else str(content)
+    return (item_type, normalize_text(content))
+
+
+def validate_affect(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    """校验单条 affect；非法返回 None（调用方只丢字段，不丢条）。
+
+    非法 = label 不在 7 类枚举 / intensity 非数字；intensity 越界按 [0,1] 截断。
+    """
+    if not isinstance(item, Mapping):
+        return None
+    raw = item.get("affect")
+    if raw is None:
+        return None
+    return sanitize_affect(raw)
+
 
 def _clean_content(value: str, max_content: int = MAX_CONTENT) -> str:
     """剔除控制字符（C0 + DEL + C1）与孤立代理字符，strip 后截断。"""
@@ -290,46 +382,185 @@ def _clean_tags(
     return tags
 
 
-def _validate_item(item: Any, limits: ExtractionConfig) -> dict[str, Any] | None:
-    """单条校验；坏条返回 None（§4.2.2 第 6 步：坏条目单条丢弃）。"""
-    if not isinstance(item, dict):
+def normalize_item(
+    m: Any,
+    limits: ExtractionConfig | None = None,
+    metrics: Metrics | None = None,
+) -> dict[str, Any] | None:
+    """逐条归一化：只做清洗与校验，不做去重（v1.5 §4.2.2 第 6 步）。
+
+    坏条目单条丢弃，不丢整批；affect 非法只丢 affect，记忆仍写入。
+    """
+    limits = limits or ExtractionConfig()
+    if not isinstance(m, dict):
+        _event(metrics, METRIC_ITEM_INVALID, reason="not_object")
         return None
-    item_type = item.get("type")
+    item_type = m.get("type")
     if not isinstance(item_type, str) or item_type not in ALLOWED_TYPES:
+        _event(metrics, METRIC_ITEM_INVALID, reason="bad_type")
         return None
-    raw_content = item.get("content")
+    raw_content = m.get("content")
     if not isinstance(raw_content, str):
+        _event(metrics, METRIC_ITEM_INVALID, reason="bad_content")
         return None
     content = _clean_content(raw_content, limits.max_content)
     if not content:
+        _event(metrics, METRIC_ITEM_INVALID, reason="empty_content")
         return None
-    # content 含哨兵串或三反引号围栏 → 丢弃该条（防注入回流，§4.2.3）
+    # content 含哨兵串或三反引号围栏 → 丢弃该条（防注入回流，§4.2.2）
     if SENT_OPEN in content or SENT_CLOSE in content or FENCE in content:
+        _event(metrics, METRIC_ITEM_INVALID, reason="sentinel_or_fence")
         return None
-    tags = _clean_tags(item.get("tags"), limits.max_tags, limits.max_tag_len)
-    return {"type": item_type, "content": content, "tags": tags}
+    tags = _clean_tags(m.get("tags"), limits.max_tags, limits.max_tag_len)
+    affect: dict[str, Any] | None = None
+    if m.get("affect") is not None:
+        affect = validate_affect(m)
+        if affect is None:
+            _event(metrics, METRIC_AFFECT_INVALID)
+    item: dict[str, Any] = {"type": item_type, "content": content, "tags": tags}
+    if affect is not None:
+        item["affect"] = affect
+    return item
 
 
-def _validate_items(raw_items: Any, limits: ExtractionConfig) -> tuple[list[dict], bool]:
-    """校验 + 批内去重 + 最多 N 条；返回 (条目, 是否因超限被截断)。"""
-    if not isinstance(raw_items, list):
-        return [], False
-    clean: list[dict] = []
+def dedup_within_batch(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 dedup_key 精确去重，保留首次（affect 不参与键，保留首次 affect）。"""
+    result: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    truncated = False
-    for raw_item in raw_items:
-        validated = _validate_item(raw_item, limits)
-        if validated is None:
-            continue
-        key = (validated["type"], validated["content"])
+    for item in items:
+        key = dedup_key(item)
         if key in seen:
             continue
         seen.add(key)
-        if len(clean) >= limits.max_items:
-            truncated = True
-            break
-        clean.append(validated)
-    return clean, truncated
+        result.append(item)
+    return result
+
+
+def _collect_items(
+    raw_items: Any,
+    limits: ExtractionConfig,
+    metrics: Metrics | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """normalize → dedup → 上限；返回 (items, over_cap)。"""
+    if not isinstance(raw_items, list):
+        return [], False
+    normalized: list[dict[str, Any]] = []
+    for raw_item in raw_items:
+        item = normalize_item(raw_item, limits, metrics)
+        if item is not None:
+            normalized.append(item)
+    items = dedup_within_batch(normalized)
+    if len(items) > limits.max_items:
+        return items[: limits.max_items], True
+    return items, False
+
+
+# 兼容旧内部名（test/旧文档可能引用）
+def _validate_items(raw_items: Any, limits: ExtractionConfig, metrics: Metrics | None = None):
+    return _collect_items(raw_items, limits, metrics)
+
+
+# --------------------------------------------------------------------------
+# 解析层 / 发送层（附录 D2 两个入口）
+# --------------------------------------------------------------------------
+
+def split_raw_candidate(raw: str | None) -> tuple[str, str | None]:
+    """只做哨兵/括号平衡定位，返回 (raw_answer, candidate_json_or_None)。
+
+    - 有哨兵：从后往前尝试，取第一个结构上含 memories 列表的候选；
+      raw_answer 一律取**最早哨兵之前**（防止伪哨兵块泄给用户）；
+    - 无哨兵：取最后一个括号平衡块，raw_answer 剔除所有候选块；
+    - 返回的 raw_answer 未清洗（发送层负责）。
+    """
+    try:
+        text = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+        text = _strip_surrogates(text)
+        positions = _sentinel_positions(text)
+        if positions:
+            for index in reversed(positions):
+                _before, candidate = _split_at(text, index)
+                try:
+                    obj = _loads_candidate(candidate)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and isinstance(obj.get("memories"), list):
+                    return text[: positions[0]], candidate
+            return text[: positions[0]], None
+        spans = _candidate_spans(text)
+        if not spans:
+            return text, None
+        start, end = spans[-1]
+        return _cut_spans(text, spans), text[start:end]
+    except Exception:
+        return (raw if isinstance(raw, str) else ""), None
+
+
+def parse_memories(
+    candidate_json: str | None,
+    limits: ExtractionConfig | None = None,
+    metrics: Metrics | None = None,
+) -> list[dict[str, Any]]:
+    """只做 loads → normalize_item → dedup_within_batch；不碰 answer、不抛异常。"""
+    if not candidate_json:
+        return []
+    limits = limits or ExtractionConfig()
+    try:
+        obj = _loads_candidate(candidate_json)
+    except Exception as exc:
+        log.warning("memory_extract bad_json exc=%s", type(exc).__name__)
+        _event(metrics, METRIC_BAD_JSON, exc_type=type(exc).__name__)
+        return []
+    memories = obj.get("memories") if isinstance(obj, dict) else None
+    if not isinstance(memories, list):
+        _event(metrics, METRIC_BAD_JSON, exc_type="invalid_structure")
+        return []
+    items, _over_cap = _collect_items(memories, limits, metrics)
+    return items
+
+
+def parse_llm_output(raw: str | None) -> tuple[str, list[dict]]:
+    """§4.2.3 解析层入口：返回 (raw_answer, memories)，永不抛异常。
+
+    注意：raw_answer **未清洗**；发送前必须过 clean_answer_for_send（附录 D2）。
+    """
+    try:
+        raw_answer, candidate = split_raw_candidate(raw)
+        memories = parse_memories(candidate) if candidate is not None else []
+        return raw_answer, memories
+    except Exception:  # pragma: no cover - split/parse 自身已兜底
+        return (raw if isinstance(raw, str) else ""), []
+
+
+def _strip_partial_sentinel(text: str) -> str:
+    """去掉末尾被截断的哨兵前缀（如 "...<MEMORY_JS"），确保残片不发给用户。"""
+    for length in range(len(SENT_OPEN) - 1, 4, -1):
+        prefix = SENT_OPEN[:length]
+        if text.endswith(prefix):
+            return text[:-length]
+    return text
+
+
+def clean_answer_for_send(raw_answer: str | None) -> str:
+    """发送层唯一清洗点（v1.5 §4.2.3 / 附录 D2）。
+
+    有哨兵取最早哨兵前（并剔除块前伪候选块）；无哨兵剔除疑似 JSON 块；
+    最差原样返回。不读取 memories、不调用 _loads_candidate。
+    """
+    try:
+        text = raw_answer if isinstance(raw_answer, str) else ("" if raw_answer is None else str(raw_answer))
+        text = _strip_surrogates(text)
+        positions = _sentinel_positions(text)
+        if positions:
+            prefix = text[: positions[0]]
+            prefix = _cut_spans(prefix, _candidate_spans(prefix))
+            return _drop_fences(_strip_partial_sentinel(prefix))
+        cut = _cut_spans(text, _candidate_spans(text))
+        return _drop_fences(_strip_partial_sentinel(cut))
+    except Exception:
+        try:
+            return (raw_answer if isinstance(raw_answer, str) else "").strip()
+        except Exception:  # pragma: no cover
+            return ""
 
 
 # --------------------------------------------------------------------------
@@ -342,7 +573,7 @@ def _raw_hash(raw: str) -> str:
         return ""
     try:
         payload = raw.encode("utf-8")
-    except UnicodeEncodeError:  # 极端代理字符：哈希不能让解析失败
+    except UnicodeEncodeError:
         payload = raw.encode("utf-8", "replace")
     return hashlib.sha256(payload).hexdigest()[:16]
 
@@ -354,39 +585,24 @@ def _strip_surrogates(text: str) -> str:
     return "".join("\ufffd" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
 
 
-def _strip_partial_sentinel(text: str) -> str:
-    """去掉末尾被截断的哨兵前缀（如 "...<MEMORY_JS"），确保残片不发给用户。
-
-    只处理长度 ≥5 的前缀，避免误伤正文里正常的 "<MEMO" 之类文本。
-    """
-    for length in range(len(SENT_OPEN) - 1, 4, -1):
-        prefix = SENT_OPEN[:length]
-        if text.endswith(prefix):
-            return text[:-length]
-    return text
-
-
 def _clean_answer(text: str) -> str:
-    """正文清洗：去不可见字符 / 首尾围栏 / 哨兵残片，再压平空行。"""
-    return _drop_fences(_strip_partial_sentinel(text))
+    """兼容旧名：发送层清洗（内部调用 clean_answer_for_send）。"""
+    return clean_answer_for_send(text)
 
 
 def _fallback_answer(raw: str) -> str:
     """兜底口径：有哨兵取哨兵前；无哨兵剔除疑似 JSON 块；最差原样返回。"""
     try:
-        positions = _sentinel_positions(raw)
-        if positions:
-            return _clean_answer(_cut_spans(raw[: positions[0]], _candidate_spans(raw[: positions[0]])))
-        return _clean_answer(_cut_spans(raw, _candidate_spans(raw)))
-    except Exception:
+        return clean_answer_for_send(raw)
+    except Exception:  # pragma: no cover
         try:
-            return _strip_partial_sentinel(raw).strip()
-        except Exception:  # pragma: no cover - str.strip 不会抛，纯防御
+            return raw.strip()
+        except Exception:
             return ""
 
 
 # --------------------------------------------------------------------------
-# 解析器
+# 解析器（状态/指标兼容入口；内部复用上面的纯函数）
 # --------------------------------------------------------------------------
 
 class MemoryOutputParser:
@@ -415,7 +631,7 @@ class MemoryOutputParser:
         except Exception as exc:  # 解析器内部未预期异常：兜底，不抛回聊天主流程
             return self._fail(raw_text=text, exc=exc, sentinel_found=sentinel_found)
 
-    # ---------- 主流程（§4.2.2 顺序固定） ----------
+    # ---------- 主流程 ----------
 
     def _parse(self, raw: str) -> ExtractResult:
         raw_len = len(raw)
@@ -426,7 +642,8 @@ class MemoryOutputParser:
         spans = _candidate_spans(raw)
         if not spans:
             return ExtractResult(
-                answer=_clean_answer(raw),
+                answer=clean_answer_for_send(raw),
+                raw_answer=raw,
                 memories=[],
                 status="no_sentinel",
                 sentinel_found=False,
@@ -435,6 +652,17 @@ class MemoryOutputParser:
             )
         return self._parse_fallback(raw, spans, raw_len, raw_hash)
 
+    def _extract(self, candidate: str) -> tuple[list[dict] | None, str | None, bool]:
+        """解析一个候选；返回 (items 或 None, exc_type, over_cap)。"""
+        try:
+            obj = _loads_candidate(candidate)
+        except Exception as exc:
+            return None, type(exc).__name__, False
+        if not isinstance(obj, dict) or not isinstance(obj.get("memories"), list):
+            return None, "invalid_structure", False
+        items, over_cap = _collect_items(obj["memories"], self.extraction, self.metrics)
+        return items, None, over_cap
+
     def _parse_sentinel(
         self,
         raw: str,
@@ -442,42 +670,29 @@ class MemoryOutputParser:
         raw_len: int,
         raw_hash: str,
     ) -> ExtractResult:
-        """第 1 步：哨兵从后往前逐个尝试，取第一个能解析出 memories 列表的。"""
-        memories: list[Any] | None = None
+        memories: list[dict] | None = None
         exc_type: str | None = None
-        error: str | None = None
         unclosed = False
+        over_cap = False
         for index in reversed(positions):
             _, candidate = _split_at(raw, index)
             if _candidate_unclosed(candidate):
                 unclosed = True
-            try:
-                obj = _loads_candidate(candidate)
-            except Exception as exc:
-                exc_type = type(exc).__name__
-                error = "json_decode"
-                continue
-            if isinstance(obj, dict) and isinstance(obj.get("memories"), list):
-                memories = obj["memories"]
-                exc_type = None
-                error = None
-                # 解析成功即证明该候选 JSON 是闭合的；后面（已被切掉）的残片不再算截断
+            items, candidate_exc, candidate_over_cap = self._extract(candidate)
+            if items is not None:
+                memories, exc_type, over_cap = items, None, candidate_over_cap
                 unclosed = False
                 break
-            exc_type = "invalid_structure"
-            error = "invalid_structure"
-
-        # 回答正文 = 最早哨兵之前的全部内容（§4.2.1 硬规则 2）：
-        # 即便靠后的哨兵解析成功，靠前的伪哨兵块也一并切掉，保证正文永不含隐藏 JSON。
-        # 哨兵前若还有 {"memories":...} 块（模型顺序漂移），也要切掉，否则会泄给用户（B7）。
-        pre_sentinel = raw[: positions[0]]
-        answer = _clean_answer(_cut_spans(pre_sentinel, _candidate_spans(pre_sentinel)))
+            exc_type = candidate_exc
+        raw_answer = raw[: positions[0]]
+        answer = clean_answer_for_send(raw_answer)
         if memories is None:
             self._record_bad_json(raw_len, raw_hash, exc_type)
             if unclosed:
                 self._record_truncated(raw_len, raw_hash)
             return ExtractResult(
                 answer=answer,
+                raw_answer=raw_answer,
                 memories=[],
                 status="bad_json",
                 sentinel_found=True,
@@ -485,16 +700,16 @@ class MemoryOutputParser:
                 exc_type=exc_type,
                 raw_len=raw_len,
                 raw_hash=raw_hash,
-                error=error,
+                error=exc_type,
             )
-        items, over_cap = _validate_items(memories, self.extraction)
         truncated = unclosed or over_cap
         if truncated:
             self._record_truncated(raw_len, raw_hash)
         return ExtractResult(
             answer=answer,
-            memories=items,
-            status="ok" if items else "empty",
+            raw_answer=raw_answer,
+            memories=memories,
+            status="ok" if memories else "empty",
             sentinel_found=True,
             truncated=truncated,
             raw_len=raw_len,
@@ -508,21 +723,19 @@ class MemoryOutputParser:
         raw_len: int,
         raw_hash: str,
     ) -> ExtractResult:
-        """第 2 步：无哨兵时用括号平衡扫描兜底（只认 memories 起点）。"""
         start, end = spans[-1]
         candidate = raw[start:end]
-        # 兜底一律把所有候选块从正文里剔除（含截断残片）
-        answer = _clean_answer(_cut_spans(raw, spans))
+        raw_answer = _cut_spans(raw, spans)
+        answer = clean_answer_for_send(raw_answer)
         unclosed = _balanced_end(raw, start) is None
-        try:
-            obj = _loads_candidate(candidate)
-        except Exception as exc:
-            exc_type = type(exc).__name__
+        items, exc_type, over_cap = self._extract(candidate)
+        if items is None:
             self._record_bad_json(raw_len, raw_hash, exc_type)
             if unclosed:
                 self._record_truncated(raw_len, raw_hash)
             return ExtractResult(
                 answer=answer,
+                raw_answer=raw_answer,
                 memories=[],
                 status="bad_json",
                 sentinel_found=False,
@@ -530,29 +743,14 @@ class MemoryOutputParser:
                 exc_type=exc_type,
                 raw_len=raw_len,
                 raw_hash=raw_hash,
-                error="json_decode",
+                error=exc_type,
             )
-        if not isinstance(obj, dict) or not isinstance(obj.get("memories"), list):
-            self._record_bad_json(raw_len, raw_hash, "invalid_structure")
-            if unclosed:
-                self._record_truncated(raw_len, raw_hash)
-            return ExtractResult(
-                answer=answer,
-                memories=[],
-                status="bad_json",
-                sentinel_found=False,
-                truncated=unclosed,
-                exc_type="invalid_structure",
-                raw_len=raw_len,
-                raw_hash=raw_hash,
-                error="invalid_structure",
-            )
-        items, over_cap = _validate_items(obj["memories"], self.extraction)
         truncated = unclosed or over_cap
         if truncated:
             self._record_truncated(raw_len, raw_hash)
         return ExtractResult(
             answer=answer,
+            raw_answer=raw_answer,
             memories=items,
             status="ok" if items else "empty",
             sentinel_found=False,
@@ -581,6 +779,7 @@ class MemoryOutputParser:
             answer = raw_text.strip()
         return ExtractResult(
             answer=answer,
+            raw_answer=raw_text,
             memories=[],
             status="fail",
             sentinel_found=sentinel_found,
@@ -599,11 +798,10 @@ class MemoryOutputParser:
             return
         try:
             self.metrics.event(name, **fields)
-        except Exception:  # pragma: no cover - Metrics.event 已自带兜底
+        except Exception:  # pragma: no cover
             log.warning("memory_extract metrics event failed: %s", name)
 
     def _record_bad_json(self, raw_len: int, raw_hash: str, exc_type: str | None) -> None:
-        """bad_json 每次解析最多记一次，字段只用 raw_len / raw_hash / exc_type。"""
         log.warning(
             "memory_extract bad_json raw_len=%s raw_hash=%s exc=%s",
             raw_len,
@@ -616,6 +814,15 @@ class MemoryOutputParser:
         self._event(METRIC_TRUNCATED, raw_len=raw_len, raw_hash=raw_hash)
 
 
+def _event(metrics: Metrics | None, name: str, **fields: Any) -> None:
+    if metrics is None:
+        return
+    try:
+        metrics.event(name, **fields)
+    except Exception:  # pragma: no cover
+        pass
+
+
 # --------------------------------------------------------------------------
 # 便捷入口
 # --------------------------------------------------------------------------
@@ -623,21 +830,8 @@ class MemoryOutputParser:
 _DEFAULT_PARSER = MemoryOutputParser()
 
 
-def parse_llm_output(raw: str | None) -> tuple[str, list[dict]]:
-    """§4.2.3 原签名：返回 (answer, memories)，永不抛异常。"""
-    try:
-        result = _DEFAULT_PARSER.parse(raw)
-        return result.answer, result.memories
-    except Exception:  # pragma: no cover - parse 自身已兜底
-        return (raw.strip() if isinstance(raw, str) else ""), []
-
-
 def sanitize_for_prompt(text: str) -> str:
-    """注入防护（§4.2.6）：哨兵 / 代码围栏全角化，幂等且永不抛异常。
-
-    用户消息、persona、滚动摘要进 prompt 前都过这一层，防止用户借哨兵改写
-    解析边界；全角形式不会被解析器识别成哨兵，也不影响语义阅读。
-    """
+    """注入防护（§4.2.6）：哨兵 / 代码围栏全角化，幂等且永不抛异常。"""
     if not isinstance(text, str):
         try:
             text = "" if text is None else str(text)
@@ -649,5 +843,5 @@ def sanitize_for_prompt(text: str) -> str:
         text = text.replace(SENT_CLOSE, _SAFE_CLOSE)
         text = text.replace(SENT_OPEN, _SAFE_OPEN)
         return text.replace(FENCE, _SAFE_FENCE)
-    except Exception:  # pragma: no cover - str.replace 不会抛，纯防御
+    except Exception:  # pragma: no cover
         return ""

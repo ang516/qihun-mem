@@ -15,12 +15,12 @@ import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .config import Config
 from .fsutil import atomic_write_text
 from .metrics import Metrics
-from .models import MemoryItem
+from .models import MemoryItem, sanitize_affect
 
 log = logging.getLogger("memory")
 
@@ -33,6 +33,7 @@ class LoadReport:
     new_bad: int = 0
     vector_loaded: int = 0
     vector_errors: int = 0
+    affect_bad: int = 0
     bad_samples: list[str] = field(default_factory=list)
 
 
@@ -91,6 +92,10 @@ class MemoryStore:
     def archive_path(self) -> Path:
         return self.cfg.archive_file
 
+    @property
+    def affect_bad_path(self) -> Path:
+        return self.cfg.affect_bad_file
+
     # ------------------------------------------------------------------
     # 加载 / 追加 / 重写
     # ------------------------------------------------------------------
@@ -101,13 +106,30 @@ class MemoryStore:
         report = LoadReport()
         raw_lines = self._read_lines(self.memory_path)
         bad_lines: list[str] = []
+        affect_bad_lines: list[str] = []
         for line in raw_lines:
             if not line.strip():
                 continue
             report.total_lines += 1
             try:
-                item = MemoryItem.from_dict(json.loads(line))
+                data = json.loads(line)
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                report.bad += 1
+                bad_lines.append(line)
+                if len(report.bad_samples) < 5:
+                    report.bad_samples.append(str(exc)[:120])
+                continue
+            # v1.5 §3.3：affect 非法只丢字段（条目仍加载），原始行另存 affect.bad.jsonl
+            if (
+                isinstance(data, Mapping)
+                and data.get("affect") is not None
+                and sanitize_affect(data.get("affect")) is None
+            ):
+                report.affect_bad += 1
+                affect_bad_lines.append(line)
+            try:
+                item = MemoryItem.from_dict(data)
+            except (ValueError, TypeError) as exc:
                 report.bad += 1
                 bad_lines.append(line)
                 if len(report.bad_samples) < 5:
@@ -120,6 +142,8 @@ class MemoryStore:
         if bad_lines and not self.read_only:
             # 只读模式（--dry-run）只统计/告警，绝不写 memory.bad.jsonl（P1-1）
             report.new_bad = self._append_bad_lines(bad_lines)
+        if affect_bad_lines and not self.read_only:
+            self._append_affect_bad_lines(affect_bad_lines)
         # 归档条目：id 自增要避免重用（B14）；turn_key 也要参与幂等判定，
         # 否则「导入→维护归档→重跑导入」会重复导入已归档条目（P1-3）。
         archived = self._archived_records()
@@ -178,6 +202,23 @@ class MemoryStore:
                 handle.write("\n".join(fresh) + "\n")
         except OSError as exc:
             log.warning("cannot append bad lines: %r", exc)
+            return 0
+        return len(fresh)
+
+    def _append_affect_bad_lines(self, lines: list[str]) -> int:
+        """affect 非法行原样搬 affect.bad.jsonl；幂等（已存在的不重复追加）。"""
+        existing: set[str] = set()
+        if self.affect_bad_path.is_file():
+            existing = set(self._read_lines(self.affect_bad_path))
+        fresh = [line for line in lines if line not in existing]
+        if not fresh:
+            return 0
+        try:
+            self.affect_bad_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.affect_bad_path, "a", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(fresh) + "\n")
+        except OSError as exc:
+            log.warning("cannot append affect bad lines: %r", exc)
             return 0
         return len(fresh)
 
@@ -361,6 +402,7 @@ class MemoryStore:
             ("memory", self.memory_path),
             ("vectors", self.vector_path),
             ("bad", self.bad_path),
+            ("affect_bad", self.affect_bad_path),
             ("archive", self.archive_path),
         ):
             try:

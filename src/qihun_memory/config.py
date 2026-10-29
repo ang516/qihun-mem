@@ -46,6 +46,7 @@ class DecayConfig:
     reinforce_sim: float = 0.5
     dedupe_sim: float = 0.9
     kv: float = 0.5
+    ka: float = 0.3
     lam: float = 0.2
     suppression_valence: float = -0.3
     suppression_avoidance: float = 0.5
@@ -57,7 +58,7 @@ class RetrievalConfig:
     """§6 检索参数。"""
 
     budget_tokens: int = 1200
-    header_tokens: int = 20
+    header_tokens: int = 24
     w_vector: float = 0.6
     w_bm25: float = 0.4
     type_bonus: Mapping[str, float] = field(
@@ -69,6 +70,66 @@ class RetrievalConfig:
     bm25_k1: float = 1.5
     bm25_b: float = 0.75
     light_path_enabled: bool = True
+    # v1.5 §7.2：rel/familiarity/user_affect/affect_match 调制
+    gamma_u: float = 0.15
+    familiarity_eta: float = 0.1
+    affect_match: bool = False
+    gamma_a: float = 0.1
+
+
+@dataclass(frozen=True)
+class AffectConfig:
+    """v1.5 §5.3 / §5.4：user_affect 聚合与衰减。"""
+
+    initial_affection: float = 0.5
+    initial_annoyance: float = 0.0
+    initial_familiarity: float = 0.3
+    step_alpha: float = 0.1
+    stale_days: float = 30.0
+    annoyance_decay_base: float = 0.9
+    annoyance_decay_period_days: float = 7.0
+
+
+@dataclass(frozen=True)
+class BridgeConfig:
+    """v1.5 §7.6：私聊 → 同用户群聊记忆的单向桥接。"""
+
+    enabled: bool = True
+    weight: float = 0.7
+    budget_tokens: int = 300
+    # 强词单命中即触发；弱词需 ≥2 个或弱词 + 实体指代
+    strong_words: tuple[str, ...] = (
+        "群里",
+        "群",
+        "群里说的",
+        "刚才群里",
+        "群聊",
+        "聊天记录",
+    )
+    weak_words: tuple[str, ...] = (
+        "刚才",
+        "刚刚",
+        "之前",
+        "上次",
+        "前面",
+        "说过",
+        "提到",
+        "聊过",
+        "记录",
+    )
+    # 实体表只收时间 / 地点 / 具体事件名词；不含日常活动动词
+    entity_patterns: tuple[str, ...] = (
+        r"(?:昨|今|明|后|大后)天",
+        r"(?:今|昨|明)晚",
+        r"(?:这|下|上)(?:周|星期|个月|月)",
+        r"周末|月底|年底|明年|今年",
+        r"(?:周|星期)[一二三四五六日天]",
+        r"\d{1,2}\s*[点时:：]\s*\d{0,2}",
+        r"\d{1,2}\s*月(?:\s*\d{1,2}\s*[日号])?",
+        r"(?:上海|北京|广州|深圳|杭州|成都|重庆|武汉|西安|南京|天津|苏州|长沙|郑州|青岛|厦门|福州|合肥|济南|昆明|大连|沈阳|哈尔滨|长春|石家庄|太原|南昌|贵阳|南宁|海口|三亚|兰州|西宁|银川|乌鲁木齐|拉萨|呼和浩特|香港|澳门|台北|东京|大阪|首尔|新加坡)",
+        r"[\u4e00-\u9fff]{2,8}(?:市|省|区|县|广场|机场|车站|火车站|高铁站|医院|公司|学校|大学|公园|酒店|餐厅|景区|岛|山|湖|路|街)",
+        r"(?:出差|旅游|加班|考试|面试|搬家|生病|住院|结婚|生日|聚餐|开会|上课|放假|请假|回家|回老家|生娃|怀孕)",
+    )
 
 
 @dataclass(frozen=True)
@@ -138,6 +199,8 @@ _SECTIONS: dict[str, type] = {
     "embedding": EmbeddingConfig,
     "decay": DecayConfig,
     "retrieval": RetrievalConfig,
+    "affect": AffectConfig,
+    "bridge": BridgeConfig,
     "extraction": ExtractionConfig,
     "prompt": PromptConfig,
     "gate": GateConfig,
@@ -179,6 +242,8 @@ class Config:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     decay: DecayConfig = field(default_factory=DecayConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    affect: AffectConfig = field(default_factory=AffectConfig)
+    bridge: BridgeConfig = field(default_factory=BridgeConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     gate: GateConfig = field(default_factory=GateConfig)
@@ -249,6 +314,14 @@ class Config:
     @property
     def users_file(self) -> Path:
         return self._under_data("users.json")
+
+    @property
+    def user_affect_file(self) -> Path:
+        return self._under_data("user_affect.json")
+
+    @property
+    def affect_bad_file(self) -> Path:
+        return self._under_data("affect.bad.jsonl")
 
     @property
     def bot_state_file(self) -> Path:
