@@ -1,5 +1,11 @@
 # 器魂-记忆系统 · v1.4 · 设计文档（schema.md）
 
+> **历史参考（historical）**：本规范自 v1.5-r2 起**已被取代**，仅作历史参考与变更追溯。
+> 当前规范（公式 / 阈值 / 语义 / 接口的唯一权威）见
+> [`QiHun-Memory-System-v1.5-r2.md`](QiHun-Memory-System-v1.5-r2.md)；实现与契约见
+> [`docs/UPGRADE-CONTRACT-v1.5-r2.md`](docs/UPGRADE-CONTRACT-v1.5-r2.md)。
+> 本文中的字段（无 `affect` / `user_affect` / 桥接）与 v1.5-r2 不一致处，一律以 v1.5-r2 为准。
+
 适用范围：一个 10 人小群 + 一个私聊 · 单实例 · 记忆峰值几百条  
 基线：v1.3→ v1.4 工程化修订  
 日期：2026-10-26
