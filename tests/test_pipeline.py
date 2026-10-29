@@ -378,7 +378,8 @@ def test_write_failure_goes_pending_and_keeps_answer(pipeline, system, monkeypat
     assert pipeline.metrics.count("mem_write.fail") >= 1
 
 
-def test_pending_replayed_at_next_prepare(pipeline, system, monkeypatch) -> None:
+def test_pending_replayed_at_next_write_back(pipeline, system, monkeypatch) -> None:
+    """v1.6 §5.5/§9：pending 重放点从 prepare 移到 write_back 8b 开始（单一重放点）。"""
     original_append = system.store.append
 
     def boom(item):
@@ -391,7 +392,9 @@ def test_pending_replayed_at_next_prepare(pipeline, system, monkeypatch) -> None
     assert system.all_items() == []
 
     monkeypatch.setattr(system.store, "append", original_append)
-    pipeline.prepare(event("下一轮消息", msgid="p2"))  # 下一轮开始前重放 1 次
+    second = pipeline.prepare(event("下一轮消息", msgid="p2"))
+    assert system.pending_count == 1  # prepare 不再隐式重放
+    pipeline.finish(second, raw_output("好的"))  # 8b 开始重放 1 次
     assert system.pending_count == 0
     assert len(system.all_items()) == 1
 

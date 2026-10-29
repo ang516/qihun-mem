@@ -307,7 +307,7 @@ def test_turn_key_registered_on_merged_only_turn(tmp_path) -> None:
     assert system.store.has_turn_key("u_1:msg-9") is True
     replay = system.remember([memory_dict()], user_id="u_1", scope="group", valence=0.0, turn_key="u_1:msg-9")
     assert replay.turn_duplicate is True
-    assert system.all_items()[0].mention_count == 2  # 重放不再累加
+    assert system.all_items()[0].mention_count == 1  # E1/E4：新建 0 + 去重命中 1，重放不再累加
 
 
 def test_dormant_mid_similarity_not_reinforced(tmp_path) -> None:

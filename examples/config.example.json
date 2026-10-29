@@ -68,10 +68,29 @@
     "max_tag_len": 16
   },
   "prompt": {
+    "total_tokens": 3850,
     "summary_tokens": 200,
     "recent_turns": 5,
     "persona_tokens": 500,
-    "recent_tokens": 750
+    "recent_tokens": 750,
+    "diary_tokens": 300,
+    "protocol_tokens": 300,
+    "system_misc_tokens": 600
+  },
+  "diary": {
+    "enabled": true,
+    "trigger": "daily",
+    "every_n": 50,
+    "daily_at": "23:50",
+    "timezone": "Asia/Shanghai",
+    "max_tokens": 300,
+    "inject_budget": 300,
+    "inject_count": 2,
+    "retain_days": 30,
+    "max_per_scope": 30,
+    "privacy_check": true,
+    "bot_nickname": "",
+    "gen_model": ""
   },
   "gate": {
     "enabled": true,

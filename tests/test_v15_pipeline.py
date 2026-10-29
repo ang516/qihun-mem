@@ -263,7 +263,9 @@ def test_write_failure_pending_then_replay_turn_key_idempotent(pipeline, system,
     assert system.all_items() == []
 
     monkeypatch.setattr(system.store, "append", original_append)
-    pipeline.prepare(event("下一轮消息", msgid="p-2"))  # prepare 开头重放一次
+    second = pipeline.prepare(event("下一轮消息", msgid="p-2"))
+    assert system.pending_count == 1  # v1.6 §5.5/§9：prepare 不再重放
+    pipeline.finish(second, raw_output("好的"))  # write_back 8b 开始重放一次
     assert system.pending_count == 0
     assert len(system.all_items()) == 1
     stored = system.all_items()[0]

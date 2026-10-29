@@ -28,7 +28,8 @@ def make_item(system: MemorySystem, **overrides) -> MemoryItem:
         created_at=now,
         last_access=now,
         access_count=0,
-        mention_count=1,
+        # v1.6-rc4（E1）：新建条目 mention_count=0（去重命中 active 才 +1）
+        mention_count=0,
         S=7.0,
         valence=0.0,
         status="active",
@@ -81,20 +82,27 @@ def test_remember_writes_memory_jsonl(system) -> None:
     assert item.valence == pytest.approx(0.5)
     assert item.status == "active"
     assert item.turn_key == "u_1:msg-1"
+    assert item.mention_count == 0  # E1：新建条目 mention_count=0
     lines = system.cfg.memory_file.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["id"] == item.id
 
 
 def test_dedupe_same_fact_mention_count(system) -> None:
-    system.remember([extracted()], user_id="u_1", scope="group", valence=0.0)
+    first = system.remember([extracted()], user_id="u_1", scope="group", valence=0.0)
+    created = first.created[0]
+    assert created.mention_count == 0  # E1：新建条目为 0
+    s_before = created.S
     report = system.remember([extracted()], user_id="u_1", scope="group", valence=0.0)
     assert len(report.created) == 0
     assert len(report.merged) == 1
     item = report.merged[0]
-    assert item.mention_count == 2
+    assert item.mention_count == 1  # E4：新建 0，仅去重命中 active 时 +1
+    assert item.S == pytest.approx(s_before)  # E4：命中 active 不触发 compute_S / 不强化
     assert item.access_count == 0  # 重复提及不是召回（§10.1）
     assert len(system.all_items()) == 1
+    # E4：不写 JSONL 新行
+    assert len(system.cfg.memory_file.read_text(encoding="utf-8").strip().splitlines()) == 1
 
 
 def test_invalid_items_dropped_individually(system) -> None:
@@ -180,8 +188,8 @@ def test_strong_match_revives_dormant(system) -> None:
     reinforced = system.reinforce(result)
     assert reinforced >= 1
     assert target.status == "active"
-    assert target.S == pytest.approx(7.0)  # §5.1 重置为 S₀，当轮不再叠加 §5.3
-    assert target.access_count == 1
+    assert target.S == pytest.approx(7.0)  # §6.1 重置为 S₀，当轮不再叠加 reinforce（E5）
+    assert target.access_count == 0  # E5：revive 不 Inc(access_count)
     assert system.metrics.count("memory.revived") >= 1
 
 
@@ -444,7 +452,7 @@ def test_dedup_key_exact_match_merges(system) -> None:
     report = system.remember([extracted("用户A下周三去上海出差!")], user_id="u_1", scope="group", valence=0.0)
     assert len(report.created) == 0
     assert len(report.merged) == 1
-    assert report.merged[0].mention_count == 2
+    assert report.merged[0].mention_count == 1  # E1/E4：新建 0，去重命中 active +1
     assert report.merged[0].access_count == 0  # 重复提及不是召回
     assert len(system.all_items()) == 1
     assert system.metrics.count("memory.deduped") == 1
@@ -462,7 +470,7 @@ def test_dedup_cosine_merges_when_key_differs(tmp_path) -> None:
     assert len(first.created) == 1
     report = system.remember([extracted("用户A下周二去上海出差")], user_id="u_1", scope="group", valence=0.0)
     assert len(report.merged) == 1
-    assert report.merged[0].mention_count == 2
+    assert report.merged[0].mention_count == 1  # E1/E4：新建 0，去重命中 active +1
     assert system.metrics.count("dedup.degraded") == 0
 
 
@@ -551,6 +559,9 @@ def test_revive_uses_compute_S_revive(system, monkeypatch) -> None:
     batch = calls[-1][1]
     assert Set("S", 7.0) in batch
     assert Set("status", "active") in batch
+    # E5：复活落库动作只有 S/status/last_access，不 Inc(access_count)、不叠 reinforce
+    assert not any(isinstance(op, Inc) and op.field == "access_count" for op in batch)
+    assert target.access_count == 0
 
 
 def test_refresh_statuses_write_goes_through_update_memory(system, monkeypatch) -> None:

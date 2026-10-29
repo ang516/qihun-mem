@@ -138,9 +138,9 @@ def test_obsidian_cli(tmp_path, capsys) -> None:
 # v1.5-r2：版本文案 / list 显示 affect / affect 子命令（§2.11）
 # ---------------------------------------------------------------------------
 
-def test_help_text_mentions_v15() -> None:
+def test_help_text_mentions_v16() -> None:
     parser = build_parser()
-    assert "v1.5-r2" in parser.description
+    assert "v1.6-rc4" in parser.description
 
 
 def test_version_flag(capsys) -> None:

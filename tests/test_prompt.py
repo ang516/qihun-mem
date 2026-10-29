@@ -6,12 +6,14 @@ import json
 
 import pytest
 
+from qihun_memory.config import PromptConfig
 from qihun_memory.models import MemoryItem, utc_now_iso
 from qihun_memory.prompt import (
     BRIDGE_SYSTEM_NOTICE,
     EXTRACTION_PROTOCOL,
     MEMORY_DATA_NOTICE,
     build_prompt,
+    measure_prompt_tokens,
     render_memory_block,
 )
 from qihun_memory.retrieval import RetrievalResult, SelectedMemory
@@ -94,6 +96,11 @@ def test_build_prompt_gate_protocol_last(users) -> None:
     assert bundle.messages[1] == {"role": "assistant", "content": "早呀"}
     assert "【会话摘要】" in bundle.messages[-1]["content"]
     assert "【当前消息】" in bundle.messages[-1]["content"]
+    # v1.6-rc4：总预算实测字段有默认值，旧调用（不传 diary_excerpts/metrics）仍兼容
+    assert bundle.diary_block == ""
+    assert bundle.truncated is False
+    assert bundle.total_tokens == measure_prompt_tokens(bundle.system_prompt, bundle.messages)
+    assert bundle.total_tokens <= PromptConfig().total_tokens
 
 
 def test_build_prompt_no_gate_no_protocol(users) -> None:

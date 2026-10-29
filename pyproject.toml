@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qihun-memory"
-version = "0.2.0"
-description = "器魂记忆系统 v1.5-r2 — 面向单个 QQ 群 + 私聊的轻量长期记忆引擎"
+version = "0.3.0"
+description = "器魂记忆系统 v1.6-rc4 — 面向单个 QQ 群 + 私聊的轻量长期记忆引擎（含情感日记叙事层）"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "ang516" }]
