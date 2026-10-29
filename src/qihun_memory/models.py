@@ -1,4 +1,4 @@
-"""数据模型（v1.5-r2 §3.1 单行 schema / §2.3 state）。
+"""数据模型（v1.6-rc4 §3.1 单行 schema / §2.3 state）。
 
 `MemoryItem` 是 `memory.jsonl` 的一行在内存中的表示；`vector` 是向量 sidecar
 的运行时投影，不落 memory.jsonl（§3 存在 `memory.vec.jsonl`）。
@@ -6,6 +6,10 @@
 v1.5 新增：
 - `affect` 事件级标签（label/intensity），非法只丢字段不丢条；
 - `Set` / `Inc` 操作符（update_memory 的白名单写入口，附录 D1）。
+
+v1.6-rc4（E1）：
+- `mention_count` 默认 0：新建条目为 0，仅 write_back 去重命中 active 条目时
+  由 memory._merge_duplicate Inc(1)（§3.1 / §6.3）。
 """
 
 from __future__ import annotations
@@ -138,7 +142,8 @@ class MemoryItem:
     created_at: str
     last_access: str
     access_count: int = 0
-    mention_count: int = 1
+    # v1.6-rc4（E1）：新建条目 mention_count=0；仅去重命中 active 时 +1（§3.1 / §6.3）
+    mention_count: int = 0
     S: float = 7.0
     valence: float = 0.0
     status: str = "active"

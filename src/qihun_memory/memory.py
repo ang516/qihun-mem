@@ -14,6 +14,18 @@ v1.5-r2 新增：
 - 每条记忆 affect（parser 归一化 → 落库；S₀ 用 compute_S("init", ...) 调制）；
 - UserAffectStore 接线（本模块只通过实例方法读写 user_affect.json）；
 - pending 只重放“新记忆写入”（带 turn_key 幂等）；强化/感情更新永不进 pending。
+
+v1.6-rc4（§0.1 / E1 / E4 / E5）：
+- 新条目 mention_count=0，仅去重命中 active 条目时 Inc(1)（E1）；
+- 去重范围只含同 user+scope+type 的 active 条目；dormant 不参与、不因去重复活（E4）；
+- 复活的落库动作 = Set(S/status/last_access)，不 Inc(access_count)、不叠 reinforce（E5）；
+- pending 重放点只在 write_back 8b 开始（remember 内部不再隐式重放，§5.5/§9）；
+- maintain() 逐阶段 try/except，失败只记 state.write_guard / mem_write.fail，不抛（§3.5）。
+
+历史：v1.5-r2 为当前事实层基线；v1.6-rc4 追加叙事层（情感日记）接线：
+- DiaryStore 是 diary.jsonl 唯一读写入口；DiaryWorker 走独立 worker（§8.2 / D7.3），
+  turn() 内绝不主动生成日记，只记账 turn；
+- 叙事层不参与检索 / S / R / user_affect，注入选择只按 scope_tag 过滤（D7.1 / D7.2）。
 """
 
 from __future__ import annotations
@@ -27,6 +39,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .config import Config
+from .diary import DiaryStore, DiaryWorker, select_excerpts
 from .embedding import Embedder, get_embedder
 from .fsutil import atomic_write_text
 from .lifecycle import compute_S, retention_now
@@ -87,6 +100,8 @@ class MaintenanceReport:
     pending_retried: int = 0
     pending_dropped: int = 0
     debug_raw_cleaned: int = 0
+    # v1.6-rc4 §3.5：叙事层过期日记移档数
+    diary_archived: int = 0
 
 
 @dataclass
@@ -134,6 +149,22 @@ class MemorySystem:
         self.users = UserDirectory(cfg.users_file)
         self.retriever = Retriever(self.embedder, cfg, self.metrics)
         self._pending: list[_PendingWrite] = []
+        # 叙事层（v1.6 §8）：DiaryStore 是 diary.jsonl 唯一读写入口；DiaryWorker 独立、
+        # 只读依赖注入；llm 由宿主/定时器在 generate() 时传入，turn() 内绝不调用（D7.3）。
+        self.diary = DiaryStore(cfg, self.metrics, read_only=self.read_only)
+        try:
+            self.diary.load()
+        except Exception as exc:  # 读取失败只降人格语境，不影响事实层（硬规则 19）
+            self.metrics.event("diary.fail", stage="load", exc_type=type(exc).__name__)
+        self.diary_worker = DiaryWorker(
+            cfg,
+            self.diary,
+            metrics=self.metrics,
+            memory_items=lambda: list(self.store.items.values()),
+            state_loader=lambda: self.state(),
+            users=self.users,
+            affect_snapshot=lambda: self.affect_store.snapshot(),
+        )
 
     # ------------------------------------------------------------------
     # 只读视图
@@ -185,6 +216,29 @@ class MemorySystem:
     def refresh_users(self, members: dict[str, str]) -> int:
         return self.users.refresh(members)
 
+    def select_diary_excerpts(
+        self, scope: str, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """叙事层注入选择（只读；任何异常 → 空节选 + diary.fail，不影响回答 §8.6）。
+
+        只按 scope_tag 过滤（group/dm；mixed 返回空），不参与事实层检索与装填。
+        """
+        empty: dict[str, Any] = {"excerpts": [], "tokens": 0, "injected": 0, "truncated": False}
+        try:
+            if not self.cfg.diary.enabled:
+                return empty
+            return select_excerpts(
+                self.diary,
+                str(scope),
+                now=now or utc_now(),
+                budget=self.cfg.diary.inject_budget,
+                count=self.cfg.diary.inject_count,
+                metrics=self.metrics,
+            )
+        except Exception as exc:
+            self.metrics.event("diary.fail", stage="select_excerpts", exc_type=type(exc).__name__)
+            return empty
+
     def stats(self) -> dict[str, Any]:
         state = self.state()
         return {
@@ -206,6 +260,8 @@ class MemorySystem:
             "users": len(self.users.snapshot()),
             "user_affect_users": len(self.affect_store.snapshot()),
             "pending_writes": len(self._pending),
+            "diary": self.diary.counts(),
+            "diary_files": self.diary.file_sizes(),
             "metrics": self.metrics.counters(),
         }
 
@@ -413,16 +469,32 @@ class MemorySystem:
             last_event_affect=last_event_affect,
         )
 
-    def reinforce(self, result: RetrievalResult, *, now: datetime | None = None) -> int:
-        """§5.3 / §5.1：被注入的记忆强化；dormant 强匹配复活（S 重置为 S₀）。
+    def reinforce(
+        self,
+        result: RetrievalResult,
+        *,
+        now: datetime | None = None,
+        revived_this_turn: set[str] | None = None,
+    ) -> int:
+        """§6.1 / §6.3 / E5：被注入的记忆强化；dormant 强匹配复活（S 重置为 S₀）。
 
+        v1.6-rc4（E5）复活优先：
+        - dormant 且 sim>0.7 → 只 revive（Set S/status/last_access），
+          不 Inc(access_count)、不再叠 reinforce（不乘 (1+R)）；
+        - active 且 sim>0.5 → reinforce（Set S/last_access + Inc access_count）；
+        - `revived_this_turn`：同轮已复活的条目不再强化（轮内去重；调用方不传时
+          按本次调用去重），避免「复活后叠强化」。
         所有状态写只经 update_memory（Set/Inc）；强化/感情更新永不进 pending。
         """
         current = now or utc_now()
         now_iso = current.isoformat(timespec="seconds")
+        revived: set[str] = revived_this_turn if revived_this_turn is not None else set()
         changed = 0
         for entry in result.selected:
             item = entry.item
+            # E5：同轮已复活 → 不叠 reinforce（不 Inc access_count、不乘 (1+R)）
+            if item.id in revived:
+                continue
             if item.status == "dormant":
                 # 只有强匹配才复活；0.5~0.7 区间不强化、不刷新 last_access，
                 # 避免出现「永远 dormant 但一直在注入」的僵尸状态（B4）
@@ -434,11 +506,11 @@ class MemorySystem:
                         Set("S", compute_S("revive", item.type, cfg=self.cfg.decay)),
                         Set("status", "active"),
                         Set("last_access", now_iso),
-                        Inc("access_count"),
                     ],
                     reason="reinforce.revive",
                 )
                 if ok:
+                    revived.add(item.id)
                     self.metrics.event("memory.revived", reason="strong_match", item_id=item.id)
                     changed += 1
                 continue
@@ -470,10 +542,18 @@ class MemorySystem:
     # ------------------------------------------------------------------
 
     def _dedup_candidates(self, user_id: str, scope: str, item_type: str) -> list[MemoryItem]:
+        """去重候选：同 user + 同 scope + 同 type 的 **active** 条目（§6.3 / E4）。
+
+        v1.6-rc4：dormant 不参与 mention 比对，也不会因去重命中而复活
+        （dormant 只走检索强匹配 sim>0.7 的 revive 路径）。
+        """
         return [
             item
             for item in self.store.items.values()
-            if item.user_id == user_id and item.scope == scope and item.type == item_type
+            if item.user_id == user_id
+            and item.scope == scope
+            and item.type == item_type
+            and item.status == "active"
         ]
 
     @staticmethod
@@ -529,19 +609,21 @@ class MemorySystem:
         match: str,
         item_type: str,
     ) -> bool:
-        """重复提及：last_access 刷新 + mention_count 自增；dormant 复活（不改 access_count）。"""
+        """E4：重复提及命中 active 条目 → 只 Set(last_access) + Inc(mention_count, 1)。
+
+        v1.6-rc4 语义：不 compute_S、不强化 S、不写 JSONL 新行、不进 pending；
+        更新失败只降记忆增益，记 mem_write.mention_fail，不抛给聊天主流程。
+        """
         ops: list[Any] = [Set("last_access", now_iso), Inc("mention_count")]
-        revived = False
-        if duplicate.status == "dormant":
-            ops.append(Set("S", compute_S("revive", duplicate.type, cfg=self.cfg.decay)))
-            ops.append(Set("status", "active"))
-            revived = True
         ok = self.update_memory(duplicate.id, ops, reason="dedup.merge")
         if not ok:  # 白名单字段不会失败；防御性记录，避免静默丢合并
-            self.metrics.event("memory.dedup_guard_fail", item_id=duplicate.id)
+            self.metrics.event(
+                "mem_write.mention_fail",
+                item_id=duplicate.id,
+                type=item_type,
+                match=match,
+            )
             return False
-        if revived:
-            self.metrics.event("memory.revived", reason="dedupe", item_id=duplicate.id)
         self.metrics.event("memory.deduped", item_id=duplicate.id, type=item_type, match=match)
         return True
 
@@ -557,7 +639,11 @@ class MemorySystem:
     ) -> WriteReport:
         """写入提取结果（输入按 parser 归一化后的条目；兼容直接 API 调用时再归一化）。
 
-        任何写盘失败都不抛异常（§4.2.5）；失败的新记忆进 pending，下一轮重试一次。
+        v1.6-rc4：
+        - 去重范围只含 active 条目，命中只 Set(last_access)+Inc(mention_count,1)（E4）；
+        - 新条目 mention_count=0（E1）；
+        - 任何写盘失败都不抛异常（§4.2.5）；失败的新记忆进 pending，
+          由 write_back 8b 开始重放一次（§5.5/§9，本方法不再隐式重放）。
         """
         current = now or utc_now()
         now_iso = current.isoformat(timespec="seconds")
@@ -577,7 +663,8 @@ class MemorySystem:
             )
             return report
 
-        self.retry_pending(now=current)
+        # v1.6 §5.5/§9：pending 重放点固定在 write_back 8b 开始（单一位置），
+        # remember() 直调 API 时不再隐式重放；失败的新记忆仍进 pending 由上游重放一次。
         self.ensure_vectors()
         degraded_noted = False
         try:
@@ -627,7 +714,8 @@ class MemorySystem:
                 created_at=now_iso,
                 last_access=now_iso,
                 access_count=0,
-                mention_count=1,
+                # v1.6-rc4（E1）：新建条目 mention_count=0，仅去重命中 active 时 +1
+                mention_count=0,
                 # 唯一 S 计算入口：影响因子 k_v / k_a 只在 lifecycle.compute_S 出现
                 S=compute_S(
                     "init",
@@ -706,43 +794,100 @@ class MemorySystem:
     # ------------------------------------------------------------------
 
     def maintain(self, *, now: datetime | None = None) -> MaintenanceReport:
-        """每日一次：判定 dormant / 移档死记忆 / 全量原子重写。"""
+        """每日一次：判定 dormant / 移档死记忆 / 全量原子重写（§3.5）。
+
+        v1.6-rc4：逐阶段 try/except，任何阶段失败只记指标
+        （state.write_guard / mem_write.fail），绝不抛给聊天主流程。
+        """
         current = now or utc_now()
-        bot_state = self.state(current)
         report = MaintenanceReport()
         dead_ids: list[str] = []
-        for item in list(self.store.items.values()):
-            # 归档/降级判定同样用未压抑 R：临时回避不能让记忆被永久移档（A4）
-            r = retention_now(item, now=current, avoidance_now=0.0, cfg=self.cfg.decay)
-            if r < self.cfg.decay.archive_r:
-                dead_ids.append(item.id)
-            elif r < self.cfg.decay.dormant_r and item.status == "active":
-                if self.update_memory(item.id, Set("status", "dormant"), reason="maintain.dormant"):
-                    report.dormant += 1
+
+        # 阶段 1：state 快照 + 未压抑 R 判定 dormant / 移档（A4：临时回避不造成永久降级）
+        try:
+            self.state(current)  # 只读快照（过期/缺失记 state.stale，不抛）
+            for item in list(self.store.items.values()):
+                try:
+                    r = retention_now(
+                        item, now=current, avoidance_now=0.0, cfg=self.cfg.decay
+                    )
+                except Exception as exc:  # 单条时间戳损坏不拖垮整个维护
+                    self._maintain_fail("scan_item", exc)
+                    continue
+                if r < self.cfg.decay.archive_r:
+                    dead_ids.append(item.id)
+                elif r < self.cfg.decay.dormant_r and item.status == "active":
+                    try:
+                        if self.update_memory(
+                            item.id, Set("status", "dormant"), reason="maintain.dormant"
+                        ):
+                            report.dormant += 1
+                    except Exception as exc:
+                        self._maintain_fail("dormant", exc, metric="state.write_guard")
+        except Exception as exc:  # 兜底：扫描失败不阻塞后续重写 / 清理
+            self._maintain_fail("scan", exc, metric="state.write_guard")
+
+        # 阶段 2：移档 + 全量原子重写（*.tmp → fsync → os.replace）
         try:
             if dead_ids:
                 report.archived = self.store.archive(dead_ids)
             self.store.rewrite()
             report.rewritten = True
-        except OSError as exc:
+        except Exception as exc:  # 含 OSError / UnicodeEncodeError 等：维护失败只记指标
             log.warning("maintenance rewrite failed: %r", exc)
-        retry = self.retry_pending(now=current)
-        report.pending_retried = retry["written"]
-        report.pending_dropped = retry["dropped"]
-        report.debug_raw_cleaned = self.clean_debug_logs(current)
+            self._maintain_fail("rewrite", exc)
+
+        # 阶段 2b：叙事层维护（§3.5）：先移档过期日记，再原子重写 diary.jsonl。
+        # 叙事层失败只降人格语境，不影响事实层（D7.1 / 硬规则 19）。
         try:
-            self.ensure_vectors()  # 维护时补算缺失向量（不阻塞聊天，§6.5）
-        except Exception:
+            report.diary_archived = self.diary.archive_expired(current)
+            self.diary.rewrite()
+        except Exception as exc:
+            self._maintain_fail("diary", exc, metric="diary.fail")
+
+        # 阶段 3：pending 重放一次（失败已在 retry_pending 内部记 mem_write.fail）
+        try:
+            retry = self.retry_pending(now=current)
+            report.pending_retried = retry["written"]
+            report.pending_dropped = retry["dropped"]
+        except Exception as exc:
+            self._maintain_fail("pending_retry", exc)
+
+        # 阶段 4：debug 原文日志清理（7 天，§12.2）
+        try:
+            report.debug_raw_cleaned = self.clean_debug_logs(current)
+        except Exception as exc:
+            self._maintain_fail("debug_clean", exc)
+
+        # 阶段 5：补算缺失向量（不阻塞聊天，§6.5）
+        try:
+            self.ensure_vectors()
+        except Exception as exc:
+            self._maintain_fail("ensure_vectors", exc)
+
+        # 阶段 6：指标落盘（指标失败也不能反噬维护）
+        try:
+            if report.archived:
+                self.metrics.event("memory.archived", count=report.archived)
+            self.metrics.event(
+                "memory.maintain",
+                archived=report.archived,
+                dormant=report.dormant,
+                rewritten=report.rewritten,
+                diary_archived=report.diary_archived,
+            )
+        except Exception:  # pragma: no cover - 指标失败绝不影响维护结果
             pass
-        if report.archived:
-            self.metrics.event("memory.archived", count=report.archived)
-        self.metrics.event(
-            "memory.maintain",
-            archived=report.archived,
-            dormant=report.dormant,
-            rewritten=report.rewritten,
-        )
         return report
+
+    def _maintain_fail(
+        self, stage: str, exc: BaseException, *, metric: str = "mem_write.fail"
+    ) -> None:
+        """维护阶段失败：只记指标（state.write_guard / mem_write.fail），绝不抛（§3.5）。"""
+        try:
+            self.metrics.event(metric, stage=stage, exc_type=type(exc).__name__, reason="maintain")
+        except Exception:  # pragma: no cover - 指标失败绝不反噬维护
+            pass
 
     # ------------------------------------------------------------------
     # 调试原文（§12.2：默认不记正文）
@@ -822,3 +967,8 @@ class MemorySystem:
             self.store.rewrite()
         except Exception as exc:
             log.warning("final rewrite failed: %r", exc)
+        # §3：diary.jsonl 同样只在每日维护或退出时全量原子替换
+        try:
+            self.diary.rewrite()
+        except Exception as exc:
+            log.warning("final diary rewrite failed: %r", exc)

@@ -1,13 +1,13 @@
-"""每轮流程（v1.5-r2 §7）。
+"""每轮流程（v1.6-rc4 §9）。
 
 实现为两阶段，便于与「LLM 调用不由本系统发起」的宿主（qq-bridge / DSH）集成：
 
-- prepare（build_context）：读 state（只读）→ 闸门（§4.1）→ 检索（§6 路由，
-  含桥接 / 打分 / fill 装填 → injected_items）→ 组 prompt（§6.5）；
-  随后冻结 ctx（§7.2）：只有 last_event_affect / metrics / pending 可写。
-- finish：parse → clean_answer_for_send → emit（先发送）→ summary/recent
-  → write_back（8a 熟悉度 → 8b 逐条落盘 → 9a 强化 → 9b 感情聚合 → 10 事件 affect）；
-  顺序由 §7.3 / 附录 D6 锁定。
+- prepare（build_context）：读 state（只读）→ 闸门（§5.1）→ 检索（§7 路由，
+  含桥接 / 打分 / fill 装填 → injected_items）→ 叙事层日记节选（§8.4，不参与检索）
+  → 组 prompt（总预算 3850，§2）；随后冻结 ctx：只有 last_event_affect / metrics / pending 可写。
+- finish：parse → clean_answer_for_send → emit（先发送）→ 摘要/最近轮 → 日记 turn 记账
+  → write_back（8a 熟悉度 → 8b pending 重放+逐条落盘 → 9a 强化/复活 → 9b 感情聚合 → 10 事件 affect）；
+  顺序由 §9 / 附录 C D5 锁定。
 
 run_turn(event, llm_call) 是两者组合的便捷入口。
 """
@@ -98,6 +98,9 @@ class PreparedTurn:
     turn_key: str
     now: datetime
     last_event_affect_at_read: dict | None
+    # v1.6 §9：叙事层注入快照（只读，≤2 篇 / ≤300 tokens）与昵称快照（只读）
+    diary_excerpts: list = field(default_factory=list)
+    users: dict = field(default_factory=dict)
     # ---------- 可写白名单（仅以下三个） ----------
     last_event_affect: dict | None = None
     metrics: dict = field(default_factory=dict)
@@ -335,13 +338,8 @@ class TurnPipeline:
         last_read: dict | None,
         started: float,
     ) -> PreparedTurn:
-        # 0. 上一轮写失败的新记忆：下一轮开始前最多重试 1 次（§4.4 / §7.4）
-        try:
-            self.system.retry_pending(now=now)
-        except Exception as exc:  # 重放失败只降记忆增益，绝不影响本轮
-            self.metrics.event(
-                "turn.prepare_error", stage="retry_pending", exc_type=type(exc).__name__
-            )
+        # 0. pending 重放已按 v1.6 §5.5/§9 前移到 write_back 8b 开始（单一重放点），
+        #    prepare 不再重放，避免同轮两次重放与顺序锁定的歧义。
 
         # 1. state.json 只读（缺失/过期 → 中性，不抛异常）
         bot_state = load_bot_state(
@@ -358,7 +356,15 @@ class TurnPipeline:
             reply_to_bot=event.reply_to_bot,
             cfg=self.cfg.gate,
         )
-        light_path = bool(self.cfg.retrieval.light_path_enabled) and is_light_message(event.message)
+        recent_turns = list(self._recent_for(key))
+        last_user_message = recent_turns[-1][0] if recent_turns else None
+        # v1.6 §7.1：轻路径五条规则（含复读与纯 @bot）需要最近一条用户消息与 at_bot 上下文
+        light_path = bool(self.cfg.retrieval.light_path_enabled) and is_light_message(
+            event.message,
+            last_user_message=last_user_message,
+            at_bot=event.at_bot,
+            cfg=self.cfg.gate,
+        )
         if light_path:
             retrieval = self._empty_retrieval(self.cfg)
         else:
@@ -378,7 +384,22 @@ class TurnPipeline:
                 )
                 retrieval = self._empty_retrieval(self.cfg)
 
-        # 3. 组 prompt：persona + 摘要 + injected_items + 最近 5 轮 + 当前消息
+        # 2b. 叙事层（v1.6 §8.4）：同 scope 的近期日记节选（≤300 tokens，最多 2 篇）。
+        #     叙事层只提供人格语境，不参与检索 / 打分 / S/R / user_affect；失败只降语境不降回答。
+        diary_excerpts: list = []
+        diary_info = {"injected": 0, "tokens": 0}
+        if bool(getattr(self.cfg.diary, "enabled", True)):
+            try:
+                picked = self.system.select_diary_excerpts(event.scope, now=now)
+                diary_excerpts = list(picked.get("excerpts") or [])
+                diary_info = {
+                    "injected": int(picked.get("injected", len(diary_excerpts)) or 0),
+                    "tokens": int(picked.get("tokens", 0) or 0),
+                }
+            except Exception as exc:  # 硬规则 19：日记读取失败不影响回答
+                self.metrics.event("diary.fail", stage="select_excerpts", exc_type=type(exc).__name__)
+
+        # 3. 组 prompt：persona + 摘要 + 日记节选 + injected_items + 最近 5 轮 + 当前消息
         summary = self.summaries.get(key)
         persona_text = self.system.persona()
         prompt = build_prompt(
@@ -386,10 +407,12 @@ class TurnPipeline:
             summary=summary,
             retrieval=retrieval,
             users=self.system.users,
-            recent_turns=list(self._recent_for(key)),
+            recent_turns=recent_turns,
             user_message=event.message,
             gate_passed=gate_passed,
             limits=self.cfg.prompt,
+            diary_excerpts=diary_excerpts,
+            metrics=self.metrics,
         )
         injected_items = list(getattr(retrieval, "injected_items", []) or [])
         affect_bias = int(getattr(retrieval, "affect_bias", 0) or 0)
@@ -408,6 +431,9 @@ class TurnPipeline:
             summary=summary,
             injected_items=injected_items,
             persona=persona_text,
+            diary_excerpts=diary_excerpts,
+            users=self.system.users.snapshot(),
+            diary_info=diary_info,
         )
 
     def _degraded_prepare(
@@ -441,6 +467,8 @@ class TurnPipeline:
             user_message=event.message,
             gate_passed=False,
             limits=self.cfg.prompt,
+            diary_excerpts=[],
+            metrics=self.metrics,
         )
         return self._build_ctx(
             event,
@@ -455,6 +483,9 @@ class TurnPipeline:
             summary=summary,
             injected_items=[],
             persona="",
+            diary_excerpts=[],
+            users={},
+            diary_info={"injected": 0, "tokens": 0},
         )
 
     def _build_ctx(
@@ -472,6 +503,9 @@ class TurnPipeline:
         summary: str,
         injected_items: list,
         persona: str,
+        diary_excerpts: list | None = None,
+        users: dict | None = None,
+        diary_info: dict | None = None,
     ) -> PreparedTurn:
         turn_id = uuid.uuid4().hex
         ctx = PreparedTurn(
@@ -491,6 +525,8 @@ class TurnPipeline:
             turn_key=turn_key,
             now=event.now or utc_now(),
             last_event_affect_at_read=last_read,
+            diary_excerpts=list(diary_excerpts or []),
+            users=dict(users or {}),
             _metrics_sink=self.metrics,
         )
         self._prepared[turn_id] = ctx
@@ -509,6 +545,8 @@ class TurnPipeline:
             tokens=int(getattr(retrieval, "tokens", 0) or 0),
             bridge_hit=int(getattr(retrieval, "bridge_hit", 0) or 0),
             degraded=bool(getattr(retrieval, "degraded", False)),
+            diary_injected=int((diary_info or {}).get("injected", 0) or 0),
+            diary_tokens=int((diary_info or {}).get("tokens", 0) or 0),
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
         )
         return ctx
@@ -567,6 +605,16 @@ class TurnPipeline:
             except Exception as exc:
                 self.metrics.event("turn.finish_error", stage="summary", exc_type=type(exc).__name__)
 
+        # 9b. 叙事层 turn 记账：every_n 按 scope 分别计数 / turn_range 取该 scope 的 turn id（§8.2）。
+        #     只记账，不生成、不落盘；失败只记指标（硬规则 20：日记生成离线异步）。
+        if not duplicate_turn:
+            try:
+                worker = getattr(self.system, "diary_worker", None)
+                if worker is not None:
+                    worker.record_turn(prepared.scope, prepared.turn_id)
+            except Exception as exc:
+                self.metrics.event("diary.fail", stage="record_turn", exc_type=type(exc).__name__)
+
         # 10. write_back：8a → 8b → 9a → 9b → 10（唯一写回路径，§7.5）
         write_report = WriteReport(skipped=len(memories_to_write), turn_duplicate=duplicate_turn)
         try:
@@ -612,6 +660,7 @@ class TurnPipeline:
             "reinforced": reinforced,
             "retrieval_degraded": prepared.retrieval.degraded,
             "injected": len(prepared.injected_items),
+            "diary_injected": len(prepared.diary_excerpts),
             "bridge_hit": int(getattr(prepared.retrieval, "bridge_hit", 0) or 0),
             "dedup_removed": int(getattr(prepared.retrieval, "dedup_removed", 0) or 0),
             "dedup_degraded": bool(getattr(prepared.retrieval, "dedup_degraded", False)),
@@ -666,7 +715,8 @@ class TurnPipeline:
                     "turn.finish_error", stage="write_back.8a", exc_type=type(exc).__name__
                 )
 
-        # 8b：逐条 persist 新记忆（失败 → pending + mem_write.fail）
+        # 8b：pending 重放（≤1 次）→ 逐条 persist 新记忆（失败 → pending + mem_write.fail）。
+        # v1.6 §5.5/§9：重放点固定在 8b 开始，prepare 与 remember() 都不再隐式重放。
         if duplicate:
             self.metrics.event(
                 "mem_write.turn_dup",
@@ -675,6 +725,14 @@ class TurnPipeline:
                 ).hexdigest()[:16],
             )
         else:
+            try:
+                self.system.retry_pending(now=now)
+            except Exception as exc:  # 重放失败只降记忆增益，不影响本轮新记忆写入
+                self.metrics.event(
+                    "turn.finish_error",
+                    stage="write_back.8b.retry",
+                    exc_type=type(exc).__name__,
+                )
             report = self._persist_items(ctx, items, now=now)
 
         # 9a：被选中注入的记忆强化 / 复活（只改内存；永不进 pending）

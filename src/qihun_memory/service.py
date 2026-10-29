@@ -15,6 +15,10 @@
   GET  /memory/search?q=&scope=&user_id=
   POST /turn/prepare  {user_id, scope, message, msgid?, at_bot?, reply_to_bot?, nickname?}
   POST /turn/finish   {turn_id, raw}
+  GET  /diary/list?scope=&limit=
+  GET  /diary/excerpts?scope=
+  POST /diary/prepare {scope, force?}
+  POST /diary/finish  {diary_id, raw}
   GET  /obsidian/notes
   GET  /obsidian/note?path=
   POST /users/refresh {members: {user_id: nickname}}
@@ -27,15 +31,18 @@ import hmac
 import json
 import logging
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .config import Config
+from .diary import DIARY_SCOPES
 from .memory import MemorySystem
 from .obsidian import ReadOnlyObsidianVault, VaultError, vault_from_config
 from .pipeline import PreparedTurn, TurnEvent, TurnPipeline, retrieval_summary
 from .prompt import EXTRACTION_PROTOCOL
+from .tokens import estimate_tokens
 from .version import __version__
 
 log = logging.getLogger("memory")
@@ -58,6 +65,7 @@ class MemoryService:
         *,
         system: MemorySystem | None = None,
         pipeline: TurnPipeline | None = None,
+        startup_maintenance: bool = False,
     ) -> None:
         self.cfg = cfg
         self.system = system or MemorySystem(cfg)
@@ -65,6 +73,14 @@ class MemoryService:
         self.vault: ReadOnlyObsidianVault | None = vault_from_config(cfg)
         self._lock = threading.RLock()
         self._prepared: dict[str, PreparedTurn] = {}
+        # 两阶段日记生成（宿主持有 LLM）：POST /diary/prepare → POST /diary/finish
+        self._diary_prepared: dict[str, Any] = {}
+        # §3.5 启动后补偿执行一次维护任务；失败只记指标，不阻塞服务启动
+        if startup_maintenance:
+            try:
+                self.system.maintain()
+            except Exception as exc:  # pragma: no cover - 防御性兜底
+                log.warning("startup maintenance failed: %r", exc)
 
     # ------------------------------------------------------------------
     # 入口
@@ -106,10 +122,18 @@ class MemoryService:
 
     def _route(self, method: str, path: str, query: dict[str, str], body) -> tuple[int, dict]:
         if path == "/health" and method == "GET":
+            diary_counts: dict = {}
+            try:
+                diary_store = getattr(self.system, "diary", None)
+                if diary_store is not None:
+                    diary_counts = diary_store.counts()
+            except Exception:  # 健康检查不允许因叙事层异常而失败
+                diary_counts = {}
             return 200, {
                 "ok": True,
                 "version": __version__,
                 "items": self.system.store.counts(),
+                "diary": diary_counts,
                 "embedder_available": bool(self.system.embedder.available),
                 "vault": str(self.vault.root) if self.vault else "",
             }
@@ -124,10 +148,20 @@ class MemoryService:
         if path == "/memory/search" and method == "GET":
             return 200, self._search_memories(query)
 
+        if path == "/diary/list" and method == "GET":
+            return 200, self._diary_list(query)
+        if path == "/diary/excerpts" and method == "GET":
+            return 200, self._diary_excerpts(query)
+
         if path == "/turn/prepare" and method == "POST":
             return 200, self._prepare_turn(self._json_body(body))
         if path == "/turn/finish" and method == "POST":
             return 200, self._finish_turn(self._json_body(body))
+
+        if path == "/diary/prepare" and method == "POST":
+            return 200, self._diary_prepare(self._json_body(body))
+        if path == "/diary/finish" and method == "POST":
+            return 200, self._diary_finish(self._json_body(body))
 
         if path == "/obsidian/notes" and method == "GET":
             return 200, self._obsidian_notes()
@@ -293,6 +327,10 @@ class MemoryService:
                 "system_prompt": prepared.prompt.system_prompt,
                 "memory_block": prepared.prompt.memory_block,
                 "summary": prepared.summary_text,
+                "diary_block": prepared.prompt.diary_block,
+                "diary_tokens": estimate_tokens(prepared.prompt.diary_block)
+                if prepared.prompt.diary_block
+                else 0,
                 "protocol": EXTRACTION_PROTOCOL if prepared.gate_passed else "",
                 "memory_ids": list(prepared.prompt.memory_ids),
             },
@@ -317,6 +355,110 @@ class MemoryService:
         result = self.pipeline.finish(prepared, raw if isinstance(raw, str) else "")
         self._prepared.pop(turn_id, None)
         return {"ok": True, **result.to_dict()}
+
+    # ------------------------------------------------------------------
+    # 叙事层（v1.6 §8）：日记只读查询 + 两阶段生成（LLM 由宿主持有）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _diary_entry_payload(entry) -> dict:
+        return {
+            "id": entry.id,
+            "date": entry.date,
+            "scope_tag": entry.scope_tag,
+            "content": entry.content,
+            "tokens": int(entry.tokens),
+            "turn_range": list(entry.turn_range),
+            "created_at": entry.created_at,
+        }
+
+    def _diary_store(self):
+        store = getattr(self.system, "diary", None)
+        if store is None:
+            raise ServiceError(503, "diary store unavailable")
+        return store
+
+    def _diary_list(self, query: dict[str, str]) -> dict:
+        scope = (query.get("scope") or "").strip()
+        if scope and scope not in DIARY_SCOPES:
+            raise ServiceError(400, "scope must be group or dm")
+        try:
+            limit = min(200, max(1, int(query.get("limit") or 50)))
+        except ValueError as exc:
+            raise ServiceError(400, "limit must be an integer") from exc
+        store = self._diary_store()
+        entries = [entry for entry in store.entries.values() if not scope or entry.scope_tag == scope]
+        entries.sort(key=lambda entry: (entry.created_at, entry.id), reverse=True)
+        return {
+            "ok": True,
+            "total": len(entries),
+            "counts": store.counts(),
+            "items": [self._diary_entry_payload(entry) for entry in entries[:limit]],
+        }
+
+    def _diary_excerpts(self, query: dict[str, str]) -> dict:
+        scope = (query.get("scope") or "").strip()
+        if scope not in DIARY_SCOPES:
+            raise ServiceError(400, "scope must be group or dm")
+        picked = self.system.select_diary_excerpts(scope)
+        return {
+            "ok": True,
+            "scope_tag": scope,
+            "injected": int(picked.get("injected", 0) or 0),
+            "tokens": int(picked.get("tokens", 0) or 0),
+            "truncated": bool(picked.get("truncated", False)),
+            "excerpts": [
+                self._diary_entry_payload(entry) for entry in picked.get("excerpts") or []
+            ],
+        }
+
+    def _diary_worker(self):
+        worker = getattr(self.system, "diary_worker", None)
+        if worker is None:
+            raise ServiceError(503, "diary worker unavailable")
+        return worker
+
+    def _diary_prepare(self, payload: dict) -> dict:
+        scope = str(payload.get("scope") or "").strip()
+        if scope not in DIARY_SCOPES:
+            raise ServiceError(400, "scope must be group or dm")
+        worker = self._diary_worker()
+        prepared = worker.prepare(scope, force=bool(payload.get("force")))
+        diary_id = uuid.uuid4().hex
+        self._diary_prepared[diary_id] = prepared
+        while len(self._diary_prepared) > TurnPipeline.MAX_PREPARED:
+            self._diary_prepared.pop(next(iter(self._diary_prepared)))
+        return {
+            "ok": True,
+            "diary_id": diary_id,
+            "scope_tag": prepared.scope_tag,
+            "due": bool(prepared.due),
+            "date": prepared.date,
+            "turn_range": list(prepared.turn_range),
+            "reason": prepared.reason,
+            "prompt": prepared.prompt,
+        }
+
+    def _diary_finish(self, payload: dict) -> dict:
+        diary_id = str(payload.get("diary_id") or "").strip()
+        raw = payload.get("raw")
+        if not diary_id:
+            raise ServiceError(400, "diary_id is required")
+        prepared = self._diary_prepared.get(diary_id)
+        if prepared is None:
+            raise ServiceError(404, f"unknown or already finished diary: {diary_id}")
+        if not isinstance(raw, str):
+            raise ServiceError(400, "raw must be a string")
+        report = self._diary_worker().finish(prepared, raw)
+        self._diary_prepared.pop(diary_id, None)
+        return {
+            "ok": True,
+            "scope_tag": report.scope_tag,
+            "status": report.status,
+            "reason": report.reason,
+            "entry_id": report.entry_id,
+            "tokens": int(report.tokens),
+        }
 
     def _obsidian_notes(self) -> dict:
         if self.vault is None:
@@ -416,14 +558,27 @@ class MemoryHTTPServer(ThreadingHTTPServer):
         super().__init__(address, _Handler)
 
 
-def create_server(cfg: Config, *, host: str | None = None, port: int | None = None, service: MemoryService | None = None):
-    service = service or MemoryService(cfg)
+def create_server(
+    cfg: Config,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    service: MemoryService | None = None,
+    startup_maintenance: bool = False,
+):
+    service = service or MemoryService(cfg, startup_maintenance=startup_maintenance)
     address = (host if host is not None else cfg.service.host, port if port is not None else cfg.service.port)
     return MemoryHTTPServer(address, service)
 
 
-def serve(cfg: Config, *, host: str | None = None, port: int | None = None) -> None:
-    server = create_server(cfg, host=host, port=port)
+def serve(
+    cfg: Config,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    startup_maintenance: bool = False,
+) -> None:
+    server = create_server(cfg, host=host, port=port, startup_maintenance=startup_maintenance)
     try:
         log.info("memory service listening on %s:%s", *server.server_address)
         server.serve_forever()

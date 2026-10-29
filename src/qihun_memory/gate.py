@@ -1,12 +1,14 @@
-"""写入闸门与检索轻路径（v1.4 §4.1 / §6.1）。
+"""写入闸门与检索轻路径（v1.6-rc4 §5.1 / §7.1）。
 
-闸门只决定「要不要在提示词末尾附提取协议」（§7），不影响检索；
-检索路由（轻路径）与闸门完全解耦。
+闸门只决定「要不要在提示词末尾附提取协议」（§5.1），不影响检索；
+检索路由（轻路径）与闸门完全解耦（§7.1 / E3）：轻路径只决定是否检索，
+不决定是否提取；轻路径消息若命中 §5.1 闸门，仍附提取协议（硬规则 5）。
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from .config import GateConfig
 
@@ -52,20 +54,85 @@ FIRST_PERSON_RE = re.compile(
     r"|养了|开始学|准备考|打算考|决定|升职|涨工资|被裁|中奖|丢|捡)"
 )
 
-_ACK_RE = re.compile(
-    r"^(?:哈+|呵+|嘿嘿+|嘿+|嗨+|hi+|hello|在吗|在么|在不在|在呢|早|早安|早啊|晚安|晚上好"
-    r"|早上好|中午好|好|好的|好滴|好嘞|行|可以|嗯+|哦+|噢+|啊+|呀+|哟+|1|6|66+|666+|"
-    r"\+1|收到|谢谢|谢啦|谢|拜拜|88|再见|草|绷|笑死|乐|难绷|确实|真实|支持|牛|牛啊|绝了"
-    r"|来了|来了来了|打卡|签到)[!！。.~～?？\s，,、]*$"
+# §7.1 寒暄词表默认值：GateConfig.greeting_words 存在时以配置为准（A 负责字段），
+# 本模块保留同值兜底，保证直接构造/鸭子类型 cfg 时行为一致。
+# 单字项只做「整句相等」匹配，不做子串匹配。
+# 与 config.GateConfig.greeting_words 默认值保持同一份语义（配置字段存在时以配置为准）。
+_DEFAULT_GREETING_WORDS: tuple[str, ...] = (
+    "你好",
+    "您好",
+    "在吗",
+    "在么",
+    "早",
+    "早安",
+    "早上好",
+    "晚安",
+    "哈哈",
+    "呵呵",
+    "嗯",
+    "嗯嗯",
+    "哦",
+    "哦哦",
+    "好",
+    "好的",
+    "行",
+    "收到",
+    "谢谢",
+    "再见",
 )
-_EMOJI_RE = re.compile(
-    r"^[\s\u200b-\u200f\u2600-\u27bf\U0001F000-\U0001FAFF\ufe0f\u2764\u2b50]+$"
-)
-_PUNCT_RE = re.compile(r"^[\s\W_]+$", re.UNICODE)
+
+# 纯 @bot 判定用：CQ 码 @ 提及与本机渲染的 @昵称
+_CQ_AT_RE = re.compile(r"\[CQ:at,[^\]]*\]", re.IGNORECASE)
+_AT_RE = re.compile(r"@[^\s@,，。.!！?？]{1,32}")
 
 
-def _normalized(text: str) -> str:
-    return (text or "").strip().lower()
+def _has_question(text: str) -> bool:
+    """§7.1：问号只认 ? / ？ 两种半/全角形式。"""
+    return "?" in text or "？" in text
+
+
+def _content_only(text: str) -> str:
+    """去掉标点 / 符号（含 emoji）/ 空白 / 控制符后的正文字符（小写）。
+
+    §7.1 的「去标点后整句完全相等」与「复读」都以本函数为比较口径；
+    单字项因此天然只做整句相等，不会做子串匹配。
+    """
+    kept: list[str] = []
+    for char in (text or "").lower():
+        category = unicodedata.category(char)
+        if category[0] in ("P", "S", "Z", "C"):
+            continue
+        kept.append(char)
+    return "".join(kept)
+
+
+def _is_no_text(text: str) -> bool:
+    """§7.1 规则 (a)：纯表情 / 纯标点 / 纯 emoji / 纯重复字符（无文字信息量）。"""
+    content = (text or "").strip()
+    if not content:
+        return True
+    if _content_only(content) == "":
+        return True
+    # 整句只有一个字符重复（哈哈哈哈哈 / 666666 / ？？？）：不携带文字信息
+    return len(set(content)) == 1
+
+
+def _greeting_words(cfg: GateConfig) -> frozenset[str]:
+    """取寒暄词表（配置优先，缺字段时用模块默认），统一为去标点后的整句集合。"""
+    raw = getattr(cfg, "greeting_words", None) or _DEFAULT_GREETING_WORDS
+    try:
+        words = [str(word) for word in raw]
+    except TypeError:  # 配置异常时退回默认，绝不因为词表让轻路径抛异常
+        words = list(_DEFAULT_GREETING_WORDS)
+    normalized = {_content_only(word) for word in words}
+    normalized.discard("")
+    return frozenset(normalized)
+
+
+def _strip_mentions(text: str) -> str:
+    """去掉 @ 提及 / CQ 码 / @昵称，用于「纯 @bot 无正文」判定。"""
+    cleaned = _CQ_AT_RE.sub(" ", text or "")
+    return _AT_RE.sub(" ", cleaned)
 
 
 def should_extract(
@@ -96,17 +163,44 @@ def should_extract(
     return False
 
 
-def is_light_message(text: str) -> bool:
-    """§6.1 轻路径：寒暄、复读、表情、无信息量短句 → 不检索。"""
-    content = _normalized(text)
-    if not content:
+def is_light_message(
+    text: str,
+    *,
+    last_user_message: str | None = None,
+    at_bot: bool = False,
+    cfg: GateConfig | None = None,
+) -> bool:
+    """§7.1 轻路径：命中任一规则即不检索（零 LLM，与闸门完全解耦）。
+
+    规则（v1.6-rc4 §7.1，E3）：
+    (a) 纯表情 / 纯标点 / 纯 emoji / 纯重复字符（无文字）→ True；
+    (b) 去首尾空白后 Unicode 字符数 <4 且不含问号（?/？）且非 @bot → True；
+    (c) 寒暄词表「去标点后整句完全相等」（GateConfig.greeting_words 可配置；
+        单字项只做整句相等，不做子串）；
+    (d) 复读：与最近一条用户消息（任意发送者）去标点后完全相同 → True；
+    (e) 纯 @bot 无正文（去掉 @提及 / CQ 码 / 昵称后无实质内容且无问号）→ True；
+    其余 False。轻路径只决定是否检索，不决定是否提取（硬规则 5 / E3）。
+    """
+    gate_cfg = cfg or GateConfig()
+    stripped = (text or "").strip()
+    # (a) 无文字信息量（含空串）
+    if _is_no_text(stripped):
         return True
-    if _EMOJI_RE.match(content) or _PUNCT_RE.match(content):
+    question = _has_question(stripped)
+    # (b) 极短句：<4 字、非提问、非 @bot
+    if len(stripped) < 4 and not question and not at_bot:
         return True
-    if _ACK_RE.match(content):
+    # @提及 / CQ 码对用户不可见：寒暄与复读按「去掉提及后的可见文本」比较
+    visible = _content_only(_strip_mentions(stripped))
+    # (c) 寒暄词表：去标点后整句完全相等
+    if visible and visible in _greeting_words(gate_cfg):
         return True
-    # 纯重复字符（哈哈哈哈哈 / ？？？ / 666666）
-    if len(content) >= 2 and len(set(content)) == 1:
+    # (d) 复读：与最近一条用户消息去标点后完全相同
+    if last_user_message is not None:
+        previous = _content_only(_strip_mentions(str(last_user_message)))
+        if visible and previous and visible == previous:
+            return True
+    # (e) 纯 @bot 无正文（去掉 @提及 / CQ 码 / 昵称后无实质内容且无问号）
+    if at_bot and not question and not visible:
         return True
-    # 极短且无语义（"嗯嗯"、"哦哦" 由 _ACK_RE 覆盖；这里兜底 1-2 个字符）
-    return len(content) <= 2
+    return False

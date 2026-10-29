@@ -144,12 +144,49 @@ class ExtractionConfig:
 
 @dataclass(frozen=True)
 class PromptConfig:
-    """§6.3 / §7 会话摘要与最近轮次（§1 预算：persona ≈500 / 最近 5 轮 ≈750）。"""
+    """§6.3 / §7 会话摘要与最近轮次（§1 预算：persona ≈500 / 最近 5 轮 ≈750）。
+
+    v1.6-rc4 §2：8k 窗口最坏预算合计 3850 = 500 + 200 + 300 + 1200 + 750 + 300 + 600，
+    新增 total_tokens（总预算）与 diary/protocol/system_misc 三个分项。
+    """
 
     summary_tokens: int = 200
     recent_turns: int = 5
     persona_tokens: int = 500
     recent_tokens: int = 750
+    # v1.6-rc4 §2：总预算与分项（实现契约 §2.1 冻结）
+    total_tokens: int = 3850
+    diary_tokens: int = 300
+    protocol_tokens: int = 300
+    system_misc_tokens: int = 600
+
+
+@dataclass(frozen=True)
+class DiaryConfig:
+    """v1.6-rc4 §8 叙事层（情感日记）参数。
+
+    字段名 / 默认值由实现契约 §2.1 冻结；diary.py 只读取本配置，不在别处写第二套默认值。
+    - trigger ∈ daily / every_n / both；daily_at 为 timezone 时区的本地 HH:MM；
+    - every_n / daily 均按 scope_tag（group / dm）分别触发与计数；
+    - max_tokens 是单篇生成上限，inject_budget / inject_count 是注入预算与篇数上限；
+    - retain_days 是硬窗口（created_at ≤ now-retain_days 移档），max_per_scope 是窗口内上限；
+    - bot_nickname 仅用于隐私护栏替换（bot 自身昵称 → 我）；gen_model 只给宿主/文档参考，
+      不参与本模块逻辑。
+    """
+
+    enabled: bool = True
+    trigger: str = "daily"  # daily | every_n | both
+    every_n: int = 50
+    daily_at: str = "23:50"  # 本地时间 HH:MM（timezone 时区）
+    timezone: str = "Asia/Shanghai"
+    max_tokens: int = 300  # 单篇上限
+    inject_budget: int = 300  # 注入预算
+    inject_count: int = 2  # 最多注入篇数
+    retain_days: int = 30  # 硬窗口
+    max_per_scope: int = 30  # 同 scope 窗口内上限
+    privacy_check: bool = True
+    bot_nickname: str = ""  # 生成时用于隐私替换（bot 自身昵称 → 我）
+    gen_model: str = ""  # 仅文档/宿主用，不参与逻辑
 
 
 @dataclass(frozen=True)
@@ -163,6 +200,29 @@ class GateConfig:
     enabled: bool = True
     enforce_write: bool = True
     extra_patterns: tuple[str, ...] = ()
+    # v1.6-rc4 §7.1 轻路径：寒暄词表按「去标点后整句完全相等」匹配（单字项不做子串匹配）
+    greeting_words: tuple[str, ...] = (
+        "你好",
+        "您好",
+        "在吗",
+        "在么",
+        "早",
+        "早安",
+        "早上好",
+        "晚安",
+        "哈哈",
+        "呵呵",
+        "嗯",
+        "嗯嗯",
+        "哦",
+        "哦哦",
+        "好",
+        "好的",
+        "行",
+        "收到",
+        "谢谢",
+        "再见",
+    )
 
 
 @dataclass(frozen=True)
@@ -203,6 +263,7 @@ _SECTIONS: dict[str, type] = {
     "bridge": BridgeConfig,
     "extraction": ExtractionConfig,
     "prompt": PromptConfig,
+    "diary": DiaryConfig,
     "gate": GateConfig,
     "state": StateConfig,
     "metrics": MetricsConfig,
@@ -219,16 +280,27 @@ def _resolve(value: str, base: Path) -> str:
     return str(path.resolve())
 
 
+def _tuple_field_names(section_cls: type) -> set[str]:
+    """默认值是 tuple 的配置项：JSON 里允许写数组，载入时统一转成 tuple。"""
+    names: set[str] = set()
+    for field_info in fields(section_cls):
+        if isinstance(field_info.default, tuple):
+            names.add(field_info.name)
+    return names
+
+
 def _build_section(section_cls: type, raw: Mapping[str, Any]) -> Any:
     allowed = {f.name for f in fields(section_cls)}
+    tuple_fields = _tuple_field_names(section_cls)
     kwargs: dict[str, Any] = {}
     for key, value in raw.items():
         if key not in allowed:
             log.warning("config: unknown key %s.%s ignored", section_cls.__name__, key)
             continue
-        kwargs[key] = value
-    if "extra_patterns" in kwargs and isinstance(kwargs["extra_patterns"], list):
-        kwargs["extra_patterns"] = tuple(str(x) for x in kwargs["extra_patterns"])
+        if key in tuple_fields and isinstance(value, list):
+            kwargs[key] = tuple(str(x) for x in value)
+        else:
+            kwargs[key] = value
     return section_cls(**kwargs)
 
 
@@ -246,6 +318,7 @@ class Config:
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
+    diary: DiaryConfig = field(default_factory=DiaryConfig)
     gate: GateConfig = field(default_factory=GateConfig)
     state: StateConfig = field(default_factory=StateConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
@@ -330,6 +403,20 @@ class Config:
     @property
     def summary_file(self) -> Path:
         return self._under_data("summary.json")
+
+    # ---------- 叙事层（v1.6-rc4 §3.4） ----------
+
+    @property
+    def diary_file(self) -> Path:
+        return self._under_data("diary.jsonl")
+
+    @property
+    def diary_archive_file(self) -> Path:
+        return self._under_data("diary.archive.jsonl")
+
+    @property
+    def diary_bad_file(self) -> Path:
+        return self._under_data("diary.bad.jsonl")
 
     @property
     def persona_file(self) -> Path:
